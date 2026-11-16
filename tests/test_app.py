@@ -46,3 +46,42 @@ def test_empty_frame_gives_message(comments, fake_encoder):
     s = _searcher(comments, fake_encoder)
     frame = s.search("   ", top_k=3)
     assert "No matching comments" in render_cards(frame, [], {}, False)
+
+
+def test_hits_table_has_rank_id_metadata_and_short_excerpt(comments, fake_encoder):
+    from commentsearch.app import EXCERPT_CHARS, hits_table, meta_columns
+
+    s = _searcher(comments, fake_encoder)
+    frame = s.search("ranchers economic", top_k=5, method="rrf", collapse=False)
+    cols = meta_columns(comments)
+    table = hits_table(frame, cols)
+    assert list(table.columns) == ["rank", "comment_id", *cols, "excerpt"]
+    assert "commenter_name" in table.columns
+    assert "text" not in table.columns and "dup_group" not in table.columns
+    assert table["excerpt"].str.len().max() <= EXCERPT_CHARS + 1
+
+
+def test_hits_table_empty_frame_keeps_columns(comments):
+    from commentsearch.app import hits_table, meta_columns
+
+    cols = meta_columns(comments)
+    table = hits_table(pd.DataFrame(), cols)
+    assert table.empty and "comment_id" in table.columns and "excerpt" in table.columns
+
+
+def test_detail_shows_selected_hit_in_each_mode(comments, fake_encoder):
+    from commentsearch.app import detail_html, meta_columns
+
+    s = _searcher(comments, fake_encoder)
+    frame = s.search("ranchers economic", top_k=3, method="rrf", collapse=False)
+    text_by_id = dict(zip(comments["comment_id"], comments["text"]))
+    cols = meta_columns(comments)
+    terms = frame.attrs["query_terms"]
+    row = 0
+    passage_html = detail_html(frame, row, "Passage", terms, text_by_id, cols)
+    full_html = detail_html(frame, row, "Full comment", terms, text_by_id, cols)
+    excerpt_html = detail_html(frame, row, "Excerpt", terms, text_by_id, cols)
+    assert "<mark>" in passage_html
+    assert frame.iloc[row]["comment_id"] in passage_html
+    assert len(full_html) >= len(excerpt_html) >= 0
+    assert "Click a row" in detail_html(None, None, "Passage", terms, text_by_id, cols)
