@@ -24,8 +24,7 @@ def test_cards_highlight_terms_and_offer_full_text(comments, fake_encoder):
 
     assert out.count("class='cs-card'") == len(frame)
     assert "<mark>" in out
-    assert "Read the full passage" in out
-    assert "Read the full comment" in out
+    assert "cs-full" in out
     assert "+0 similar" not in out  # badge only when there are similar comments
 
 
@@ -85,3 +84,47 @@ def test_detail_shows_selected_hit_in_each_mode(comments, fake_encoder):
     assert frame.iloc[row]["comment_id"] in passage_html
     assert len(full_html) >= len(excerpt_html) >= 0
     assert "Click a row" in detail_html(None, None, "Passage", terms, text_by_id, cols)
+
+
+def test_show_modes_run_shortest_to_longest():
+    from commentsearch.app import SHOW_MODES
+
+    assert SHOW_MODES == ["Excerpt", "Passage", "Full comment"]
+
+
+def test_excerpt_is_short_enough_to_keep_rows_on_one_line(comments, fake_encoder):
+    from commentsearch.app import EXCERPT_CHARS, hits_table, meta_columns
+
+    long_text = " ".join(["ranchers wells groundwater"] * 80)
+    raw = pd.DataFrame({"id": ["L"], "text": [long_text]})
+    from commentsearch.ingest import prepare_comments
+
+    long_comments = prepare_comments(raw, "id", "text")
+    s = _searcher(long_comments, fake_encoder)
+    frame = s.search("ranchers wells", top_k=1, method="dense", collapse=False)
+    table = hits_table(frame, meta_columns(long_comments))
+    assert table["excerpt"].str.len().max() <= EXCERPT_CHARS + 1
+
+
+def test_table_columns_choice_keeps_rank_and_file_order(comments, fake_encoder):
+    from commentsearch.app import default_table_columns, hits_table, meta_columns, select_table_columns
+
+    s = _searcher(comments, fake_encoder)
+    frame = s.search("ranchers economic", top_k=3, method="rrf", collapse=False)
+    table = hits_table(frame, meta_columns(comments))
+    defaults = default_table_columns(table)
+    assert defaults[0] == "rank" and defaults[-1] == "excerpt"
+    picked = select_table_columns(table, ["commenter_name"])
+    assert list(picked.columns) == ["rank", "commenter_name"]
+    everything = select_table_columns(table, list(table.columns))
+    assert list(everything.columns) == list(table.columns)
+
+
+def test_min_score_cut_renumbers_ranks(comments, fake_encoder):
+    from commentsearch.app import apply_min_score
+
+    s = _searcher(comments, fake_encoder)
+    frame = s.search("ranchers economic wells", top_k=5, method="rrf", collapse=False)
+    cut = apply_min_score(frame, frame["score"].max())
+    assert len(cut) >= 1 and list(cut["rank"]) == list(range(1, len(cut) + 1))
+    assert apply_min_score(frame, None) is frame

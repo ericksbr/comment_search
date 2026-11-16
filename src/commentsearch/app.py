@@ -1,4 +1,4 @@
-"""Gradio UI over a Searcher: query, fusion, rerank, collapse, metadata filters, result cards and table, CSV download."""
+"""Gradio UI over a Searcher: query, fusion, rerank, collapse, metadata filters, a hits table with a detail panel, CSV download."""
 
 import html
 import os
@@ -12,22 +12,17 @@ from .search import highlight
 MAX_CATEGORICAL_VALUES = 100
 _NOT_FILTERABLE = {"comment_id", "text", "dup_group", "dup_group_size"}
 _TABLE_INTERNAL = {"comment_id", "text", "dup_group", "dup_group_size", "boilerplate"}
-EXCERPT_CHARS = 200
-SHOW_MODES = ["Passage", "Excerpt", "Full comment"]
+EXCERPT_CHARS = 160
+# Shortest to longest, as shown on the right of the table.
+SHOW_MODES = ["Excerpt", "Passage", "Full comment"]
+ALWAYS_SHOWN = ["rank"]
 
 CARD_CSS = """
 <style>
-.cs-results{font-family:inherit}
-.cs-card{border:1px solid #d0d7de;border-radius:10px;padding:14px 16px;margin:12px 0;max-width:960px}
+.cs-card{border:1px solid #d0d7de;border-radius:10px;padding:14px 16px;margin:8px 0;max-width:960px}
 .cs-head{font-size:15px;margin-bottom:6px}
 .cs-rank{font-weight:700;margin-right:6px}
-.cs-score{color:#57606a;margin-left:8px;font-size:13px}
-.cs-badge{background:#ddf4ff;color:#0969da;border-radius:12px;padding:1px 8px;margin-left:6px;font-size:13px}
-.cs-chips{margin:6px 0}
-.cs-chip{background:#fff8c5;border:1px solid #d4a72c;border-radius:12px;padding:1px 8px;margin-right:4px;font-size:13px;color:#24292f}
-.cs-snip{font-size:16px;line-height:1.55;margin:8px 0}
-.cs-full{font-size:15px;line-height:1.6;margin:8px 0 4px 0;max-height:420px;overflow:auto;padding:8px 10px;border-left:3px solid #d0d7de}
-.cs-card details summary{cursor:pointer;color:#0969da;margin-top:6px}
+.cs-full{font-size:15px;line-height:1.6;margin:8px 0 4px 0;max-height:520px;overflow:auto;padding:8px 10px;border-left:3px solid #d0d7de}
 .cs-card mark{background:#ffe08a;color:#1f2328;padding:0 2px;border-radius:3px}
 .cs-muted{color:#57606a;font-size:13px}
 </style>
@@ -74,39 +69,20 @@ def _message(text: str) -> str:
     return f"{CARD_CSS}<p class='cs-muted'>{html.escape(text)}</p>"
 
 
-def _card(row, terms: list[str], text_by_id: dict, collapse: bool) -> str:
-    passage = str(row["passage"]) if "passage" in row else str(row["snippet"])
-    full_comment = text_by_id.get(row["comment_id"], "")
-    chips = "".join(f"<span class='cs-chip'>{html.escape(t)}</span>" for t in matched_terms(passage, terms))
-    if not chips:
-        chips = "<span class='cs-muted'>none of the query words appear in this passage</span>"
-    similar = int(row["search_group_size"]) - 1
-    badge = f"<span class='cs-badge'>+{similar} similar</span>" if collapse and similar > 0 else ""
-    name = str(row.get("commenter_name", "") or "")
-    name_html = f" · {html.escape(name)}" if name else ""
-    return (
-        "<div class='cs-card'>"
-        f"<div class='cs-head'><span class='cs-rank'>#{int(row['rank'])}</span>"
-        f"<b>{html.escape(str(row['comment_id']))}</b>{name_html}"
-        f"<span class='cs-score'>score {float(row['score']):.3f}</span>{badge}</div>"
-        f"<div class='cs-chips'>{chips}</div>"
-        f"<div class='cs-snip'>{highlight(str(row['snippet']), terms)}</div>"
-        "<details><summary>Read the full passage</summary>"
-        f"<div class='cs-full'>{highlight(passage, terms)}</div></details>"
-        "<details><summary>Read the full comment</summary>"
-        f"<div class='cs-full'>{highlight(full_comment, terms)}</div></details>"
-        "</div>"
-    )
-
-
 def render_cards(frame: pd.DataFrame, terms: list[str], text_by_id: dict, collapse: bool) -> str:
-    """HTML for the results: one card per comment, highlighted matches, expandable full text."""
+    """HTML cards for the results (kept for export and tests; the window shows the table)."""
     if frame.empty:
         return _message("No matching comments. Check the filters.")
-    shown = ", ".join(terms) if terms else "none"
-    parts = [CARD_CSS, f"<div class='cs-results'><p class='cs-muted'>{len(frame)} results · query words: {html.escape(shown)}</p>"]
-    parts += [_card(row, terms, text_by_id, collapse) for _, row in frame.iterrows()]
-    parts.append("</div>")
+    parts = [CARD_CSS]
+    for _, row in frame.iterrows():
+        passage = str(row["passage"]) if "passage" in row else str(row["snippet"])
+        parts.append(
+            "<div class='cs-card'>"
+            f"<div class='cs-head'><span class='cs-rank'>#{int(row['rank'])}</span>"
+            f"<b>{html.escape(str(row['comment_id']))}</b></div>"
+            f"<div class='cs-full'>{highlight(passage, terms)}</div>"
+            "</div>"
+        )
     return "\n".join(parts)
 
 
@@ -130,6 +106,30 @@ def hits_table(frame: pd.DataFrame, meta_cols: list[str]) -> pd.DataFrame:
     excerpts = [str(s) for s in frame["snippet"]]
     out["excerpt"] = [s[:EXCERPT_CHARS] + ("…" if len(s) > EXCERPT_CHARS else "") for s in excerpts]
     return out[cols]
+
+
+def default_table_columns(hits: pd.DataFrame) -> list[str]:
+    """Shown by default: rank, comment ID, and the first few metadata columns, then the excerpt."""
+    cols = list(hits.columns)
+    meta = [c for c in cols if c not in ("rank", "comment_id", "excerpt")]
+    return ["rank", "comment_id", *meta[:3], "excerpt"] if "excerpt" in cols else cols
+
+
+def select_table_columns(hits: pd.DataFrame, chosen) -> pd.DataFrame:
+    """The table with only the chosen columns, in the file's order. Rank is always kept."""
+    if hits.empty and len(hits.columns) == 0:
+        return hits
+    keep = [c for c in hits.columns if c in set(chosen) | set(ALWAYS_SHOWN)]
+    return hits[keep] if keep else hits
+
+
+def apply_min_score(frame: pd.DataFrame, min_score) -> pd.DataFrame:
+    """Drop hits below min_score. Scores depend on the fusion method, so this is a rough cut-off."""
+    if frame.empty or min_score is None:
+        return frame
+    kept = frame[frame["score"].astype(float) >= float(min_score)].copy()
+    kept["rank"] = range(1, len(kept) + 1)
+    return kept
 
 
 def detail_html(frame, row, mode: str, terms: list[str], text_by_id: dict, meta_cols: list[str]) -> str:
@@ -162,12 +162,13 @@ def make_app(searcher, title: str = "Local comment search"):
     import gradio as gr
 
     comments = searcher.index.comments
+    n_comments = len(comments)
     text_by_id = dict(zip(comments["comment_id"], comments["text"]))
     cat_cols, date_cols = _filter_columns(comments)
     table_meta = meta_columns(comments)
     empty_hits = hits_table(pd.DataFrame(), table_meta)
 
-    def run(query, top_k, method, alpha, rerank, collapse, date_from, date_to, *cat_values):
+    def run(query, top_k, show_all, min_score, method, alpha, rerank, collapse, date_from, date_to, *cat_values):
         filters: dict = {}
         for (col, _), values in zip(cat_cols, cat_values):
             if values:
@@ -176,37 +177,53 @@ def make_app(searcher, title: str = "Local comment search"):
             lo, hi = _parse_date(date_from), _parse_date(date_to)
             if lo is not None or hi is not None:
                 filters[date_cols[0]] = (lo, hi)
+        no_columns = gr.update()
         if not (query or "").strip():
-            return "Enter a query.", None, empty_hits, None, []
+            return "Enter a query.", None, empty_hits, None, [], no_columns, None
         frame = searcher.search(
             query,
-            top_k=int(top_k),
+            top_k=n_comments if show_all else int(top_k),
             method=method,
             alpha=float(alpha),
             rerank=bool(rerank),
             collapse=bool(collapse),
             filters=filters,
         )
+        frame = apply_min_score(frame, min_score)
         terms = frame.attrs.get("query_terms", [])
         timings = frame.attrs.get("timings", {})
-        status = "No matching comments (check the filters)." if frame.empty else "  ·  ".join(
-            f"{k} {v:.3f}s" for k, v in timings.items()
+        status = "No matching comments (check the filters)." if frame.empty else (
+            f"**{len(frame):,} hits shown**  ·  " + "  ·  ".join(f"{k} {v:.3f}s" for k, v in timings.items())
         )
         fd, csv_path = tempfile.mkstemp(suffix=".csv", prefix="commentsearch_results_")
         os.close(fd)
         frame.to_csv(csv_path, index=False)  # plain text in the CSV (no <mark> tags)
-        return status, csv_path, hits_table(frame, table_meta), frame, terms
+        hits = hits_table(frame, table_meta)
+        defaults = default_table_columns(hits) if len(hits.columns) else []
+        choices = list(hits.columns) if len(hits.columns) else list(empty_hits.columns)
+        return (
+            status,
+            csv_path,
+            select_table_columns(hits, defaults),
+            frame,
+            terms,
+            gr.update(choices=choices, value=defaults),
+            hits,
+        )
 
     with gr.Blocks(title=title) as demo:
         gr.Markdown(
-            f"## {title}\nHybrid search over {len(comments):,} comments "
+            f"## {title}\nHybrid search over {n_comments:,} comments "
             f"({searcher.index.meta['n_passages']:,} passages). Models run locally; no comment text leaves this runtime."
         )
         with gr.Row():
             query = gr.Textbox(label="Query", placeholder="e.g. economic impacts on ranchers", scale=4)
             go = gr.Button("Search", variant="primary", scale=1)
         with gr.Row():
-            top_k = gr.Slider(1, 50, value=10, step=1, label="Top-k comments")
+            top_k = gr.Slider(1, max(n_comments, 1), value=min(50, max(n_comments, 1)), step=1, label="Top-k comments")
+            show_all = gr.Checkbox(value=False, label="Show all matching comments (slower for large files)")
+            min_score = gr.Number(value=None, label="Hide hits below this score (scale depends on fusion)")
+        with gr.Row():
             method = gr.Radio(["rrf", "blend", "dense", "bm25"], value="rrf", label="Fusion (rrf = Reciprocal Rank Fusion)")
             alpha = gr.Slider(0, 1, value=0.5, step=0.05, label="Blend alpha (dense weight, used only by blend)")
         with gr.Row():
@@ -228,19 +245,28 @@ def make_app(searcher, title: str = "Local comment search"):
         frame_state = gr.State(None)
         terms_state = gr.State([])
         row_state = gr.State(None)
+        hits_state = gr.State(None)  # every column of every hit; the table shows a chosen subset
 
         with gr.Row():
             with gr.Column(scale=3):
-                hits = gr.Dataframe(value=empty_hits, interactive=False, wrap=True, label="Hits (click a row)")
+                table_columns = gr.CheckboxGroup(choices=list(empty_hits.columns), value=[], label="Table columns")
+                hits = gr.Dataframe(value=empty_hits, interactive=False, wrap=False, label="Hits (click a row)")
             with gr.Column(scale=2):
-                show_mode = gr.Radio(SHOW_MODES, value="Passage", label="Show")
+                show_mode = gr.Radio(SHOW_MODES, value="Excerpt", label="Show")
                 detail = gr.HTML(value=_message("Click a row in the table to see the comment here."))
         download = gr.DownloadButton("Download results as CSV", value=None)
 
-        inputs = [query, top_k, method, alpha, rerank, collapse, date_from, date_to, *cat_inputs]
-        outputs = [status, download, hits, frame_state, terms_state]
+        inputs = [query, top_k, show_all, min_score, method, alpha, rerank, collapse, date_from, date_to, *cat_inputs]
+        outputs = [status, download, hits, frame_state, terms_state, table_columns, hits_state]
         go.click(run, inputs=inputs, outputs=outputs)
         query.submit(run, inputs=inputs, outputs=outputs)
+
+        def on_columns(chosen, all_hits):
+            if all_hits is None:
+                return empty_hits
+            return select_table_columns(all_hits, chosen)
+
+        table_columns.change(on_columns, inputs=[table_columns, hits_state], outputs=hits)
 
         def on_select(evt: gr.SelectData, frame, terms, mode):
             row = evt.index[0]
