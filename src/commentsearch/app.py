@@ -177,7 +177,7 @@ def make_app(searcher, title: str = "Local comment search"):
             if lo is not None or hi is not None:
                 filters[date_cols[0]] = (lo, hi)
         if not (query or "").strip():
-            return _message("Enter a query."), "Enter a query.", None, empty_hits, None, []
+            return "Enter a query.", None, empty_hits, None, []
         frame = searcher.search(
             query,
             top_k=int(top_k),
@@ -192,11 +192,10 @@ def make_app(searcher, title: str = "Local comment search"):
         status = "No matching comments (check the filters)." if frame.empty else "  ·  ".join(
             f"{k} {v:.3f}s" for k, v in timings.items()
         )
-        cards = render_cards(frame, terms, text_by_id, bool(collapse))
         fd, csv_path = tempfile.mkstemp(suffix=".csv", prefix="commentsearch_results_")
         os.close(fd)
         frame.to_csv(csv_path, index=False)  # plain text in the CSV (no <mark> tags)
-        return cards, status, csv_path, hits_table(frame, table_meta), frame, terms
+        return status, csv_path, hits_table(frame, table_meta), frame, terms
 
     with gr.Blocks(title=title) as demo:
         gr.Markdown(
@@ -230,20 +229,16 @@ def make_app(searcher, title: str = "Local comment search"):
         terms_state = gr.State([])
         row_state = gr.State(None)
 
-        with gr.Tabs():
-            with gr.Tab("Cards"):
-                cards = gr.HTML(value=_message("Type a query and press Search."))
-            with gr.Tab("Table"):
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        hits = gr.Dataframe(value=empty_hits, interactive=False, wrap=True, label="Hits (click a row)")
-                    with gr.Column(scale=2):
-                        show_mode = gr.Radio(SHOW_MODES, value="Passage", label="Show")
-                        detail = gr.HTML(value=_message("Click a row in the table to see the comment here."))
+        with gr.Row():
+            with gr.Column(scale=3):
+                hits = gr.Dataframe(value=empty_hits, interactive=False, wrap=True, label="Hits (click a row)")
+            with gr.Column(scale=2):
+                show_mode = gr.Radio(SHOW_MODES, value="Passage", label="Show")
+                detail = gr.HTML(value=_message("Click a row in the table to see the comment here."))
         download = gr.DownloadButton("Download results as CSV", value=None)
 
         inputs = [query, top_k, method, alpha, rerank, collapse, date_from, date_to, *cat_inputs]
-        outputs = [cards, status, download, hits, frame_state, terms_state]
+        outputs = [status, download, hits, frame_state, terms_state]
         go.click(run, inputs=inputs, outputs=outputs)
         query.submit(run, inputs=inputs, outputs=outputs)
 
