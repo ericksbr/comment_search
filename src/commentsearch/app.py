@@ -1,6 +1,4 @@
-"""Gradio UI over a Searcher: query, fusion, rerank, collapse, metadata filters, result cards, CSV download."""
-
-from __future__ import annotations
+"""Gradio UI over a Searcher: query, fusion, rerank, collapse, metadata filters, result cards and table, CSV download."""
 
 import html
 import os
@@ -13,6 +11,9 @@ from .search import highlight
 
 MAX_CATEGORICAL_VALUES = 100
 _NOT_FILTERABLE = {"comment_id", "text", "dup_group", "dup_group_size"}
+_TABLE_INTERNAL = {"comment_id", "text", "dup_group", "dup_group_size", "boilerplate"}
+EXCERPT_CHARS = 200
+SHOW_MODES = ["Passage", "Excerpt", "Full comment"]
 
 CARD_CSS = """
 <style>
@@ -49,6 +50,11 @@ def _filter_columns(comments: pd.DataFrame):
     return categorical, dates
 
 
+def meta_columns(comments: pd.DataFrame) -> list[str]:
+    """Metadata columns from the file (everything except the text and internal columns), in file order."""
+    return [c for c in comments.columns if c not in _TABLE_INTERNAL]
+
+
 def _parse_date(text):
     text = (text or "").strip()
     if not text:
@@ -74,7 +80,7 @@ def _card(row, terms: list[str], text_by_id: dict, collapse: bool) -> str:
     chips = "".join(f"<span class='cs-chip'>{html.escape(t)}</span>" for t in matched_terms(passage, terms))
     if not chips:
         chips = "<span class='cs-muted'>none of the query words appear in this passage</span>"
-    similar = int(row["group_size"]) - 1
+    similar = int(row["search_group_size"]) - 1
     badge = f"<span class='cs-badge'>+{similar} similar</span>" if collapse and similar > 0 else ""
     name = str(row.get("commenter_name", "") or "")
     name_html = f" · {html.escape(name)}" if name else ""
@@ -104,6 +110,53 @@ def render_cards(frame: pd.DataFrame, terms: list[str], text_by_id: dict, collap
     return "\n".join(parts)
 
 
+def _cell(value) -> str:
+    """A table cell as text: blank for missing values, the date for dates, the text otherwise."""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return ""
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    return str(value)
+
+
+def hits_table(frame: pd.DataFrame, meta_cols: list[str]) -> pd.DataFrame:
+    """One row per hit: rank, comment ID, the file's metadata columns, and a short excerpt."""
+    cols = ["rank", "comment_id", *meta_cols, "excerpt"]
+    if frame.empty:
+        return pd.DataFrame(columns=cols)
+    out = pd.DataFrame({"rank": frame["rank"].to_numpy(), "comment_id": frame["comment_id"].to_numpy()})
+    for col in meta_cols:
+        out[col] = [_cell(v) for v in frame[col]] if col in frame.columns else ""
+    excerpts = [str(s) for s in frame["snippet"]]
+    out["excerpt"] = [s[:EXCERPT_CHARS] + ("…" if len(s) > EXCERPT_CHARS else "") for s in excerpts]
+    return out[cols]
+
+
+def detail_html(frame, row, mode: str, terms: list[str], text_by_id: dict, meta_cols: list[str]) -> str:
+    """The selected hit, with query words highlighted. mode is one of SHOW_MODES."""
+    if frame is None or len(frame) == 0 or row is None:
+        return _message("Click a row in the table to see the comment here.")
+    r = frame.iloc[int(row)]
+    if mode == "Excerpt":
+        body = str(r["snippet"])
+    elif mode == "Full comment":
+        body = text_by_id.get(r["comment_id"], "")
+    else:
+        body = str(r["passage"]) if "passage" in r.index else str(r["snippet"])
+    facts = " · ".join(
+        f"{html.escape(col)}: {html.escape(str(r[col]))}"
+        for col in meta_cols
+        if col in r.index and str(r[col]) != ""
+    )
+    return (
+        f"{CARD_CSS}<div class='cs-card'>"
+        f"<div class='cs-head'><span class='cs-rank'>#{int(r['rank'])}</span><b>{html.escape(str(r['comment_id']))}</b></div>"
+        f"<div class='cs-muted'>{facts}</div>"
+        f"<div class='cs-full'>{highlight(body, terms)}</div>"
+        "</div>"
+    )
+
+
 def make_app(searcher, title: str = "Local comment search"):
     """Build the Gradio Blocks app. Nothing leaves the runtime; there is no external API."""
     import gradio as gr
@@ -111,6 +164,8 @@ def make_app(searcher, title: str = "Local comment search"):
     comments = searcher.index.comments
     text_by_id = dict(zip(comments["comment_id"], comments["text"]))
     cat_cols, date_cols = _filter_columns(comments)
+    table_meta = meta_columns(comments)
+    empty_hits = hits_table(pd.DataFrame(), table_meta)
 
     def run(query, top_k, method, alpha, rerank, collapse, date_from, date_to, *cat_values):
         filters: dict = {}
@@ -122,7 +177,7 @@ def make_app(searcher, title: str = "Local comment search"):
             if lo is not None or hi is not None:
                 filters[date_cols[0]] = (lo, hi)
         if not (query or "").strip():
-            return _message("Enter a query."), "Enter a query.", None
+            return _message("Enter a query."), "Enter a query.", None, empty_hits, None, []
         frame = searcher.search(
             query,
             top_k=int(top_k),
@@ -141,7 +196,7 @@ def make_app(searcher, title: str = "Local comment search"):
         fd, csv_path = tempfile.mkstemp(suffix=".csv", prefix="commentsearch_results_")
         os.close(fd)
         frame.to_csv(csv_path, index=False)  # plain text in the CSV (no <mark> tags)
-        return cards, status, csv_path
+        return cards, status, csv_path, hits_table(frame, table_meta), frame, terms
 
     with gr.Blocks(title=title) as demo:
         gr.Markdown(
@@ -170,13 +225,37 @@ def make_app(searcher, title: str = "Local comment search"):
                 date_from = gr.Textbox(visible=False)
                 date_to = gr.Textbox(visible=False)
         status = gr.Markdown()
-        cards = gr.HTML(value=_message("Type a query and press Search."))
+
+        frame_state = gr.State(None)
+        terms_state = gr.State([])
+        row_state = gr.State(None)
+
+        with gr.Tabs():
+            with gr.Tab("Cards"):
+                cards = gr.HTML(value=_message("Type a query and press Search."))
+            with gr.Tab("Table"):
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        hits = gr.Dataframe(value=empty_hits, interactive=False, wrap=True, label="Hits (click a row)")
+                    with gr.Column(scale=2):
+                        show_mode = gr.Radio(SHOW_MODES, value="Passage", label="Show")
+                        detail = gr.HTML(value=_message("Click a row in the table to see the comment here."))
         download = gr.DownloadButton("Download results as CSV", value=None)
 
         inputs = [query, top_k, method, alpha, rerank, collapse, date_from, date_to, *cat_inputs]
-        outputs = [cards, status, download]
+        outputs = [cards, status, download, hits, frame_state, terms_state]
         go.click(run, inputs=inputs, outputs=outputs)
         query.submit(run, inputs=inputs, outputs=outputs)
+
+        def on_select(evt: gr.SelectData, frame, terms, mode):
+            row = evt.index[0]
+            return detail_html(frame, row, mode, terms, text_by_id, table_meta), row
+
+        def on_mode(mode, frame, terms, row):
+            return detail_html(frame, row, mode, terms, text_by_id, table_meta)
+
+        hits.select(on_select, inputs=[frame_state, terms_state, show_mode], outputs=[detail, row_state])
+        show_mode.change(on_mode, inputs=[show_mode, frame_state, terms_state, row_state], outputs=detail)
     return demo
 
 

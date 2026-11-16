@@ -200,7 +200,7 @@ class Searcher:
 
         Filters are applied before ranking. Each comment is scored by its best passage.
         With ``collapse=True`` only the best-ranked comment of each duplicate group is shown,
-        and ``group_size`` counts the group members that pass the filters.
+        and ``search_group_size`` counts the group members that pass the filters.
         """
         if method not in METHODS:
             raise ValueError(f"method must be one of {METHODS}")
@@ -288,7 +288,7 @@ class Searcher:
                 "snippet": [make_snippet(self._p_text[p], terms) for p in passage_ids],
                 "passage": [self._p_text[p] for p in passage_ids],
                 "chunk_idx": self._p_chunk[passage_ids],
-                "group_size": group_counts[self._labels[ordered]],
+                "search_group_size": group_counts[self._labels[ordered]],
             }
         )
         meta = self.index.comments.iloc[ordered][self._meta_cols].reset_index(drop=True)
@@ -322,7 +322,7 @@ class Searcher:
 
     def _empty(self, terms, timings, t0):
         timings["total"] = round(time.perf_counter() - t0, 4)
-        cols = ["rank", "score", "comment_id", "snippet", "passage", "chunk_idx", "group_size", *self._meta_cols]
+        cols = ["rank", "score", "comment_id", "snippet", "passage", "chunk_idx", "search_group_size", *self._meta_cols]
         frame = pd.DataFrame(columns=cols)
         frame.attrs.update({"timings": timings, "query_terms": terms})
         return frame
