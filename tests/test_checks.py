@@ -92,3 +92,18 @@ def test_self_test_finds_source_comment(fake_encoder):
     index = _build(comments, fake_encoder)
     result = self_test(Searcher(index, encoder=fake_encoder), n=3, top_k=3)
     assert result.passed, result.line()
+
+
+def test_cover_text_check_accepts_split_words_and_citations(fake_encoder):
+    """Splitting 'wells.The' or keeping 'ORS 192.11.023' whole is not a loss of text."""
+    comments = pd.DataFrame({"comment_id": ["1"], "text": ["Costs rise.The wells.The end cite ORS 192.11.023 today."]})
+    passages = pd.DataFrame(
+        {"comment_row": [0, 0], "text": ["Costs rise. The wells. The end cite ORS 192.11.023", "ORS 192.11.023 today."]}
+    )
+    assert check_passages_cover_text(comments, passages).passed
+
+
+def test_cover_text_check_catches_a_changed_citation(fake_encoder):
+    comments = pd.DataFrame({"comment_id": ["1"], "text": ["See ORS 192.11.023 for details."]})
+    passages = pd.DataFrame({"comment_row": [0], "text": ["See ORS 192.11.032 for details."]})
+    assert not check_passages_cover_text(comments, passages).passed

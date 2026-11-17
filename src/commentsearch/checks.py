@@ -47,20 +47,41 @@ def check_every_comment_has_passage(comments: pd.DataFrame, passages: pd.DataFra
     )
 
 
+def _without_spaces(text: str) -> str:
+    return "".join(str(text).split())
+
+
 def check_passages_cover_text(comments: pd.DataFrame, passages: pd.DataFrame) -> Check:
-    """Every word of each comment appears in its passages, so nothing is lost when splitting."""
-    by_row: dict[int, set[str]] = {}
+    """Every character of each comment (ignoring whitespace) is in at least one of its passages.
+
+    Word tokens are not compared on purpose: how a word splits at punctuation ("wells.The") or in
+    citations ("ORS 192.11.023") is a tokenization choice, not a loss. This check only asks whether
+    any text went missing.
+    """
+    passages_by_row: dict[int, list[str]] = {}
     for row, text in zip(passages["comment_row"].to_numpy(), passages["text"].to_numpy()):
-        by_row.setdefault(int(row), set()).update(str(text).split())
+        passages_by_row.setdefault(int(row), []).append(_without_spaces(text))
     bad = []
     for row, text in enumerate(comments["text"].to_numpy()):
-        words = set(str(text).split())
-        if not words.issubset(by_row.get(row, set())):
+        full = _without_spaces(text)
+        covered = np.zeros(len(full), dtype=bool)
+        altered = False
+        for piece in passages_by_row.get(row, []):
+            if not piece:
+                continue
+            at = full.find(piece)
+            if at < 0:
+                altered = True  # a passage that is not in the comment means its text changed
+                break
+            while at >= 0:
+                covered[at : at + len(piece)] = True
+                at = full.find(piece, at + 1)
+        if altered or not covered.all():
             bad.append(row)
     return Check(
-        "Passages cover every word of every comment",
+        "Passages cover every character of every comment (whitespace ignored)",
         not bad,
-        "all words covered" if not bad else f"{len(bad):,} comments lose words when split",
+        "all text covered" if not bad else f"{len(bad):,} comments lose text when split",
     )
 
 
