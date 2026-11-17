@@ -47,17 +47,17 @@ def test_empty_frame_gives_message(comments, fake_encoder):
     assert "No matching comments" in render_cards(frame, [], {}, False)
 
 
-def test_hits_table_has_rank_id_metadata_and_short_excerpt(comments, fake_encoder):
-    from commentsearch.app import EXCERPT_CHARS, hits_table, meta_columns
+def test_hits_table_has_rank_id_and_metadata_but_no_excerpt(comments, fake_encoder):
+    from commentsearch.app import hits_table, meta_columns
 
     s = _searcher(comments, fake_encoder)
     frame = s.search("ranchers economic", top_k=5, method="rrf", collapse=False)
     cols = meta_columns(comments)
     table = hits_table(frame, cols)
-    assert list(table.columns) == ["rank", "comment_id", *cols, "excerpt"]
+    assert list(table.columns) == ["rank", "comment_id", *cols]
     assert "commenter_name" in table.columns
     assert "text" not in table.columns and "dup_group" not in table.columns
-    assert table["excerpt"].str.len().max() <= EXCERPT_CHARS + 1
+    assert "excerpt" not in table.columns  # the text is shown in the preview, not the list
 
 
 def test_hits_table_empty_frame_keeps_columns(comments):
@@ -65,7 +65,7 @@ def test_hits_table_empty_frame_keeps_columns(comments):
 
     cols = meta_columns(comments)
     table = hits_table(pd.DataFrame(), cols)
-    assert table.empty and "comment_id" in table.columns and "excerpt" in table.columns
+    assert table.empty and "comment_id" in table.columns and "rank" in table.columns
 
 
 def test_detail_shows_selected_hit_in_each_mode(comments, fake_encoder):
@@ -105,8 +105,8 @@ def test_show_modes_run_shortest_to_longest():
     assert SHOW_MODES == ["Excerpt", "Passage", "Full comment"]
 
 
-def test_excerpt_is_short_enough_to_keep_rows_on_one_line(comments, fake_encoder):
-    from commentsearch.app import EXCERPT_CHARS, hits_table, meta_columns
+def test_list_has_no_long_text_so_rows_stay_short(comments, fake_encoder):
+    from commentsearch.app import hits_table, meta_columns
 
     long_text = " ".join(["ranchers wells groundwater"] * 80)
     raw = pd.DataFrame({"id": ["L"], "text": [long_text]})
@@ -116,7 +116,7 @@ def test_excerpt_is_short_enough_to_keep_rows_on_one_line(comments, fake_encoder
     s = _searcher(long_comments, fake_encoder)
     frame = s.search("ranchers wells", top_k=1, method="dense", collapse=False)
     table = hits_table(frame, meta_columns(long_comments))
-    assert table["excerpt"].str.len().max() <= EXCERPT_CHARS + 1
+    assert all(table[c].astype(str).str.len().max() < 200 for c in table.columns)
 
 
 def test_table_columns_choice_keeps_rank_and_file_order(comments, fake_encoder):
@@ -126,7 +126,7 @@ def test_table_columns_choice_keeps_rank_and_file_order(comments, fake_encoder):
     frame = s.search("ranchers economic", top_k=3, method="rrf", collapse=False)
     table = hits_table(frame, meta_columns(comments))
     defaults = default_table_columns(table)
-    assert defaults[0] == "rank" and defaults[-1] == "excerpt"
+    assert defaults[0] == "rank" and defaults[1] == "comment_id" and "excerpt" not in defaults
     picked = select_table_columns(table, ["commenter_name"])
     assert list(picked.columns) == ["rank", "commenter_name"]
     everything = select_table_columns(table, list(table.columns))

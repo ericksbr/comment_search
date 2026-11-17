@@ -1,5 +1,5 @@
-"""Gradio UI over a Searcher: a query box that updates as you type, exact or fuzzy matching, a hits table with a
-detail panel, and CSV download. Nothing leaves the runtime."""
+"""Gradio UI over a Searcher: a query box that updates as you type, exact or fuzzy matching, a hits list with a
+preview panel, and CSV download. Nothing leaves the runtime."""
 
 import html
 import os
@@ -38,23 +38,48 @@ HOW_TO_TEXT = (
     "**Fuzzy (by meaning):** finds comments whose sentences are similar in meaning, even without the same "
     "words. The cutoff sets how close a match must be. The blue sentences are the ones that matched."
 )
+HOW_TO_PLAIN = (
+    "Exact words: every word must appear; word endings are ignored ('impact' finds 'impacts'); "
+    "quotes require the words in order. Yellow = matched words. "
+    "Fuzzy (by meaning): comments similar in meaning, even without the same words; the cutoff sets how close. "
+    "Blue = sentences at or above the cutoff. Arrow keys or j / k move through the hits."
+)
 # Provisional guess. A data-based default is planned (see notes); the slider stays adjustable.
 DEFAULT_MIN_SIMILARITY = 0.6
 SIMILARITY_INFO = "Higher = stricter. Fuzzy results and blue sentences are at or above this value."
 
 CARD_CSS = """
 <style>
-.cs-card{border:1px solid #d0d7de;border-radius:10px;padding:14px 16px;margin:8px 0}
-.cs-head{font-size:15px;margin-bottom:6px}
+.cs-card{border:1px solid #d0d7de;border-radius:10px;padding:12px 14px;margin:6px 0}
+.cs-head{font-size:15px;margin-bottom:4px}
 .cs-rank{font-weight:700;margin-right:6px}
-.cs-full{font-size:15px;line-height:1.6;margin:8px 0 4px 0;max-height:70vh;overflow:auto;padding:8px 10px;border-left:3px solid #d0d7de}
+.cs-full{font-size:14.5px;line-height:1.5;margin:6px 0 2px 0;max-height:calc(100vh - 250px);min-height:200px;overflow:auto;padding:6px 10px;border-left:3px solid #d0d7de}
 .cs-card mark, .cs-exact{background:#ffe08a;color:#1f2328;padding:0 2px;border-radius:3px}
 .cs-sent{background:#cfe8ff;color:#1f2328;padding:0 2px;border-radius:3px}
 .cs-legend{font-size:13px;color:#57606a;margin:4px 0}
 .cs-muted{color:#57606a;font-size:13px}
+.cs-title{margin:0 0 2px 0;font-size:15px}
+.cs-info{cursor:help;color:#57606a;border:1px solid #d0d7de;border-radius:50%;padding:0 6px;font-size:12px;margin-left:4px}
 .cs-table, .cs-table table, .cs-table td, .cs-table th {font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif !important;}
+.cs-table td, .cs-table th {font-size:12.5px !important;padding:2px 6px !important;line-height:1.25 !important;}
+.cs-table tr.selected td, .cs-table td.selected, .cs-table .selected {background:#e8f1ff !important;box-shadow:none !important;outline:none !important;}
+.cs-position{font-size:13px;color:#57606a;text-align:center;padding-top:8px}
 </style>
 """
+
+# Arrow keys and j/k move through the hits. Buttons are found by their labels.
+KEY_JS = """() => {
+  const press = (label) => {
+    const b = [...document.querySelectorAll('button')].find(x => x.innerText.trim() === label);
+    if (b) b.click();
+  };
+  document.addEventListener('keydown', (e) => {
+    const tag = (e.target && e.target.tagName) || '';
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(tag) || (e.target && e.target.isContentEditable)) return;
+    if (e.key === 'ArrowDown' || e.key === 'j') { press('Next ▶'); e.preventDefault(); }
+    if (e.key === 'ArrowUp' || e.key === 'k') { press('◀ Previous'); e.preventDefault(); }
+  });
+}"""
 
 
 def meta_columns(comments: pd.DataFrame) -> list[str]:
@@ -72,7 +97,7 @@ def _message(text: str) -> str:
 
 
 def render_cards(frame: pd.DataFrame, terms: list[str], text_by_id: dict, collapse: bool) -> str:
-    """HTML cards for the results (kept for export and tests; the window shows the table)."""
+    """HTML cards for the results (kept for export and tests; the window shows the list and preview)."""
     if frame.empty:
         return _message("No matching comments.")
     parts = [CARD_CSS]
@@ -98,23 +123,21 @@ def _cell(value) -> str:
 
 
 def hits_table(frame: pd.DataFrame, meta_cols: list[str]) -> pd.DataFrame:
-    """One row per hit: rank, comment ID, the file's metadata columns, and a short excerpt."""
-    cols = ["rank", "comment_id", *meta_cols, "excerpt"]
+    """One row per hit: rank, comment ID and the file's metadata columns. The text is shown in the preview."""
+    cols = ["rank", "comment_id", *meta_cols]
     if frame.empty:
         return pd.DataFrame(columns=cols)
     out = pd.DataFrame({"rank": frame["rank"].to_numpy(), "comment_id": frame["comment_id"].to_numpy()})
     for col in meta_cols:
         out[col] = [_cell(v) for v in frame[col]] if col in frame.columns else ""
-    excerpts = [str(s) for s in frame["snippet"]]
-    out["excerpt"] = [s[:EXCERPT_CHARS] + ("…" if len(s) > EXCERPT_CHARS else "") for s in excerpts]
     return out[cols]
 
 
 def default_table_columns(hits: pd.DataFrame) -> list[str]:
-    """Shown by default: rank, comment ID, and the first few metadata columns, then the excerpt."""
+    """Shown by default: rank, comment ID, and the first few metadata columns."""
     cols = list(hits.columns)
-    meta = [c for c in cols if c not in ("rank", "comment_id", "excerpt")]
-    return ["rank", "comment_id", *meta[:3], "excerpt"] if "excerpt" in cols else cols
+    meta = [c for c in cols if c not in ("rank", "comment_id")]
+    return ["rank", "comment_id", *meta[:3]]
 
 
 def select_table_columns(hits: pd.DataFrame, chosen) -> pd.DataFrame:
@@ -182,6 +205,13 @@ def detail_html(frame, row, mode: str, text_by_id: dict, meta_cols: list[str], s
     )
 
 
+def position_text(frame, row) -> str:
+    """'Hit 3 of 45' under the list, or nothing when there are no hits."""
+    if frame is None or len(frame) == 0 or row is None:
+        return ""
+    return f"Hit {int(row) + 1:,} of {len(frame):,}"
+
+
 def search_comments(searcher, query: str, match: str, collapse: bool, min_similarity: float):
     """Exact: every comment with all the words (or phrases). Fuzzy: comments at or above the cutoff."""
     n = len(searcher.index.comments)
@@ -200,10 +230,24 @@ def make_app(searcher, title: str = "Local comment search"):
     table_meta = meta_columns(comments)
     empty_hits = hits_table(pd.DataFrame(), table_meta)
 
-    def run(query, match, similarity, collapse):
+    def sentences_for(frame, row):
+        """Sentence similarities for the selected comment (fuzzy results only)."""
+        if frame is None or row is None or len(frame) == 0:
+            return None
+        plan = frame.attrs.get("plan") or {}
+        query_text = plan.get("query")
+        if not query_text:
+            return None
+        comment_row = int(frame.attrs["rows"][int(row)])
+        return searcher.sentence_similarities(query_text, [comment_row]).get(comment_row, [])
+
+    def render(frame, row, mode):
+        return detail_html(frame, row, mode, text_by_id, table_meta, sentences_for(frame, row)), position_text(frame, row)
+
+    def run(query, match, similarity, collapse, mode):
         no_columns = gr.update()
         if not (query or "").strip():
-            return "Type a word or phrase to search.", None, empty_hits, None, no_columns, None
+            return "Type a word or phrase to search.", None, empty_hits, None, no_columns, None, None, *render(None, None, mode)
         frame = search_comments(searcher, query, match, bool(collapse), similarity)
         if frame.empty:
             if match == MATCH_EXACT:
@@ -227,6 +271,8 @@ def make_app(searcher, title: str = "Local comment search"):
         hits = hits_table(frame, table_meta)
         defaults = default_table_columns(hits) if len(hits.columns) else []
         choices = list(hits.columns) if len(hits.columns) else list(empty_hits.columns)
+        first = 0 if len(frame) else None
+        detail, position = render(frame, first, mode)
         return (
             status,
             csv_path,
@@ -234,65 +280,89 @@ def make_app(searcher, title: str = "Local comment search"):
             frame,
             gr.update(choices=choices, value=defaults),
             hits,
+            first,
+            detail,
+            position,
         )
 
     with gr.Blocks(title=title, fill_height=True) as demo:
         gr.HTML(CARD_CSS)
-        gr.Markdown(
-            f"## {title}\nSearch {n_comments:,} comments. Models run locally; no comment text leaves this runtime."
+        gr.HTML(
+            f"<div class='cs-title'><b>{html.escape(title)}</b> · {n_comments:,} comments · "
+            "models run locally; no comment text leaves this runtime"
+            f"<span class='cs-info' title='{html.escape(HOW_TO_PLAIN, quote=True)}'>ⓘ</span></div>"
         )
-        gr.Markdown(HOW_TO_TEXT)
-        with gr.Row():
+        with gr.Row(equal_height=True):
             query = gr.Textbox(
-                label="Search", placeholder='e.g. economic impacts  or  "public hearing"', scale=4, autofocus=True
+                lines=1, max_lines=1, show_label=False, container=False, scale=6, autofocus=True,
+                placeholder='Search, e.g. economic impacts or "public hearing"',
             )
-            go = gr.Button("Search", variant="primary", scale=1)
+            go = gr.Button("Search", variant="primary", scale=1, min_width=90)
         with gr.Row():
-            match = gr.Radio(MATCH_MODES, value=MATCH_EXACT, label="Match", info=MATCH_INFO, scale=3)
+            exact_btn = gr.Button("Exact words", size="sm", variant="primary", min_width=110)
+            fuzzy_btn = gr.Button("Fuzzy (by meaning)", size="sm", variant="secondary", min_width=150)
             similarity = gr.Slider(
                 0.0, 1.0, value=DEFAULT_MIN_SIMILARITY, step=0.01,
-                label="Similarity cutoff (cosine)", info=SIMILARITY_INFO, visible=False, scale=2,
+                label="Similarity cutoff", info="Higher = stricter", visible=False, scale=2,
             )
-            collapse = gr.Checkbox(value=True, label="Show one comment per group of duplicates", scale=2)
+            collapse = gr.Checkbox(value=True, label="One per duplicate group", scale=2)
         status = gr.Markdown()
-        download = gr.DownloadButton("Download results as CSV", value=None)
 
+        match_state = gr.State(MATCH_EXACT)
         frame_state = gr.State(None)
         row_state = gr.State(None)
-        hits_state = gr.State(None)  # every column of every hit; the table shows a chosen subset
+        hits_state = gr.State(None)  # every column of every hit; the list shows a chosen subset
 
         with gr.Row(equal_height=False):
-            with gr.Column(scale=3):
-                table_columns = gr.CheckboxGroup(choices=list(empty_hits.columns), value=[], label="Table columns")
+            with gr.Column(scale=2, min_width=320):
+                with gr.Accordion("Columns and download", open=False):
+                    table_columns = gr.CheckboxGroup(choices=list(empty_hits.columns), value=[], label="Columns")
+                    download = gr.DownloadButton("Download results as CSV", value=None)
                 hits = gr.Dataframe(
                     value=empty_hits,
                     interactive=False,
                     wrap=False,
-                    label="Hits (click a row to preview it)",
-                    max_height=650,
+                    show_label=False,
+                    max_height=520,
                     elem_classes="cs-table",
                 )
-            with gr.Column(scale=2):
-                show_mode = gr.Radio(SHOW_MODES, value="Excerpt", label="Show", info=SHOW_MODE_INFO)
+                with gr.Row():
+                    prev_btn = gr.Button("◀ Previous", size="sm")
+                    position = gr.Markdown("", elem_classes="cs-position")
+                    next_btn = gr.Button("Next ▶", size="sm")
+            with gr.Column(scale=3):
+                with gr.Row():
+                    show_mode = gr.Radio(SHOW_MODES, value="Excerpt", show_label=False, container=False, scale=5)
+                    gr.HTML(
+                        f"<span class='cs-info' title='{html.escape(SHOW_MODE_INFO, quote=True)}'>ⓘ</span>",
+                        min_width=40,
+                    )
                 detail = gr.HTML(value=_message("Click a row in the table to see the comment here."))
 
         with gr.Accordion("Compare the two exact-match engines (developer check)", open=False):
             compare_btn = gr.Button("Compare for the current search")
             compare_out = gr.Markdown()
 
-        inputs = [query, match, similarity, collapse]
-        outputs = [status, download, hits, frame_state, table_columns, hits_state]
+        inputs = [query, match_state, similarity, collapse, show_mode]
+        outputs = [status, download, hits, frame_state, table_columns, hits_state, row_state, detail, position]
         go.click(run, inputs=inputs, outputs=outputs)
         query.submit(run, inputs=inputs, outputs=outputs)
         query.change(run, inputs=inputs, outputs=outputs, trigger_mode="always_last")
-        match.change(run, inputs=inputs, outputs=outputs)
         similarity.release(run, inputs=inputs, outputs=outputs)
         collapse.change(run, inputs=inputs, outputs=outputs)
 
-        def on_match(choice):
-            return gr.update(visible=choice == MATCH_FUZZY)
+        def set_match(choice):
+            is_fuzzy = choice == MATCH_FUZZY
+            return (
+                choice,
+                gr.update(variant="secondary" if is_fuzzy else "primary"),
+                gr.update(variant="primary" if is_fuzzy else "secondary"),
+                gr.update(visible=is_fuzzy),
+            )
 
-        match.change(on_match, inputs=match, outputs=similarity)
+        match_outputs = [match_state, exact_btn, fuzzy_btn, similarity]
+        exact_btn.click(lambda: set_match(MATCH_EXACT), None, match_outputs).then(run, inputs, outputs)
+        fuzzy_btn.click(lambda: set_match(MATCH_FUZZY), None, match_outputs).then(run, inputs, outputs)
 
         def on_columns(chosen, all_hits):
             if all_hits is None:
@@ -301,22 +371,26 @@ def make_app(searcher, title: str = "Local comment search"):
 
         table_columns.change(on_columns, inputs=[table_columns, hits_state], outputs=hits)
 
-        def sentences_for(frame, row, query_text):
-            if frame is None or row is None or len(frame) == 0 or not query_text:
-                return None
-            comment_row = int(frame.attrs["rows"][int(row)])
-            return searcher.sentence_similarities(query_text, [comment_row]).get(comment_row, [])
-
-        def show(frame, row, mode):
-            query_text = (frame.attrs.get("plan") or {}).get("query") if frame is not None and len(frame) else None
-            return detail_html(frame, row, mode, text_by_id, table_meta, sentences_for(frame, row, query_text))
-
         def on_select(evt: gr.SelectData, frame, mode):
             row = evt.index[0]
-            return show(frame, row, mode), row
+            detail_text, pos = render(frame, row, mode)
+            return row, detail_text, pos
+
+        def on_step(step, frame, row, mode):
+            if frame is None or len(frame) == 0 or row is None:
+                return row, *render(frame, row, mode)
+            new_row = min(max(int(row) + step, 0), len(frame) - 1)
+            return new_row, *render(frame, new_row, mode)
 
         def on_mode(mode, frame, row):
-            return show(frame, row, mode)
+            return render(frame, row, mode)[0]
+
+        hits.select(on_select, inputs=[frame_state, show_mode], outputs=[row_state, detail, position])
+        prev_btn.click(lambda f, r, m: on_step(-1, f, r, m), inputs=[frame_state, row_state, show_mode],
+                       outputs=[row_state, detail, position])
+        next_btn.click(lambda f, r, m: on_step(1, f, r, m), inputs=[frame_state, row_state, show_mode],
+                       outputs=[row_state, detail, position])
+        show_mode.change(on_mode, inputs=[show_mode, frame_state, row_state], outputs=detail)
 
         def on_compare(q):
             if not (q or "").strip():
@@ -335,9 +409,8 @@ def make_app(searcher, title: str = "Local comment search"):
                 lines.append("The two engines return the same comments for this search.")
             return "\n\n".join(lines)
 
-        hits.select(on_select, inputs=[frame_state, show_mode], outputs=[detail, row_state])
-        show_mode.change(on_mode, inputs=[show_mode, frame_state, row_state], outputs=detail)
         compare_btn.click(on_compare, inputs=query, outputs=compare_out)
+        demo.load(None, None, None, js=KEY_JS)
     return demo
 
 
