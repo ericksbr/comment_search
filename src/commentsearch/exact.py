@@ -18,6 +18,9 @@ WORD_RE = re.compile(r"[A-Za-z0-9]+")
 PHRASE_RE = re.compile(r'"([^"]+)"')
 STOP = frozenset(STOPWORDS_EN)
 ENGINES = ("fts5", "bm25s")
+# "all": every word and phrase must appear (AND). "any": at least one must appear (OR).
+MODE_ALL = "all"
+MODE_ANY = "any"
 
 
 class PorterWords:
@@ -100,20 +103,35 @@ class StemPostings:
     def stems_of_text(self, text: str) -> list[str]:
         return [self.stem_of.get(w, "") for w in WORD_RE.findall(text.lower())]
 
-    def match(self, plan: dict) -> np.ndarray:
-        """Rows of comments that contain every loose stem and every phrase, in row order."""
-        if is_empty(plan):
-            return np.array([], dtype=np.int64)
-        # Phrase words (stop words included) are a cheap pre-filter; the exact order is checked below.
-        needed = dict.fromkeys(plan["loose_stems"] + [s for ps in plan["phrase_stems"] for s in ps])
+    def _postings_all(self, stems: list[str]) -> np.ndarray:
+        """Rows of comments that contain every one of the stems."""
         rows = None
-        for stem in needed:
+        for stem in dict.fromkeys(stems):
             found = self.postings.get(stem, np.array([], dtype=np.int64))
             rows = found if rows is None else np.intersect1d(rows, found, assume_unique=True)
             if rows.size == 0:
-                return rows
-        if rows is None:
-            rows = np.arange(len(self.texts), dtype=np.int64)
+                break
+        return np.arange(len(self.texts), dtype=np.int64) if rows is None else rows
+
+    def _phrase_rows(self, phrase_stems: list[str]) -> np.ndarray:
+        """Rows of comments that contain the phrase, words in order."""
+        rows = self._postings_all(phrase_stems)
+        keep = [r for r in rows if _phrase_at(self.stems_of_text(self.texts[r]), phrase_stems)]
+        return np.asarray(keep, dtype=np.int64)
+
+    def match(self, plan: dict, mode: str = MODE_ALL) -> np.ndarray:
+        """Rows of comments that match: all of the words and phrases (mode 'all'), or any of them ('any')."""
+        if is_empty(plan):
+            return np.array([], dtype=np.int64)
+        if mode == MODE_ANY:
+            parts = [self._postings_all([s]) for s in plan["loose_stems"]]
+            parts += [self._phrase_rows(ps) for ps in plan["phrase_stems"]]
+            out = np.array([], dtype=np.int64)
+            for part in parts:
+                out = np.union1d(out, part)
+            return out.astype(np.int64)
+        # Phrase words (stop words included) are a cheap pre-filter; the exact order is checked below.
+        rows = self._postings_all(plan["loose_stems"] + [s for ps in plan["phrase_stems"] for s in ps])
         if plan["phrases"]:
             keep = [
                 r for r in rows
@@ -134,18 +152,18 @@ def build_fts(texts: list[str]) -> sqlite3.Connection:
     return conn
 
 
-def fts_query(plan: dict) -> str:
-    """FTS5 syntax: each loose word and each phrase is a quoted term; adjacent terms are ANDed."""
+def fts_query(plan: dict, mode: str = MODE_ALL) -> str:
+    """FTS5 syntax: each loose word and each phrase is a quoted term. Adjacent terms are ANDed, or ORed in 'any' mode."""
     parts = [f'"{w}"' for w in plan["loose"]] + [f'"{" ".join(p)}"' for p in plan["phrases"]]
-    return " ".join(parts)
+    return (" OR " if mode == MODE_ANY else " ").join(parts)
 
 
-def match_fts(conn: sqlite3.Connection, plan: dict) -> tuple[np.ndarray, np.ndarray]:
+def match_fts(conn: sqlite3.Connection, plan: dict, mode: str = MODE_ALL) -> tuple[np.ndarray, np.ndarray]:
     """Rows and BM25 scores (higher is better), most relevant first."""
     if is_empty(plan):
         return np.array([], dtype=np.int64), np.array([], dtype=np.float64)
     rows = conn.execute(
-        "SELECT rowid, -bm25(docs) FROM docs WHERE docs MATCH ? ORDER BY bm25(docs)", (fts_query(plan),)
+        "SELECT rowid, -bm25(docs) FROM docs WHERE docs MATCH ? ORDER BY bm25(docs)", (fts_query(plan, mode),)
     ).fetchall()
     if not rows:
         return np.array([], dtype=np.int64), np.array([], dtype=np.float64)

@@ -95,3 +95,39 @@ def test_compare_exact_reports_both_engines(comments, fake_encoder):
     report = s.compare_exact("impacts")
     assert report["fts5"] == report["bm25s"] == report["both"]
     assert report["only_fts5_count"] == 0 and report["only_bm25s_count"] == 0
+
+
+def test_any_mode_matches_either_word_and_both_engines_agree(comments, fake_encoder):
+    from commentsearch.exact import MODE_ALL, MODE_ANY
+
+    s = _searcher(comments, fake_encoder)
+    for q in ["elk wells", '"economic impacts" elk', "ranchers hearing"]:
+        all_rows = set(s._exact_rows(q, "bm25s", MODE_ALL)[0].tolist())
+        any_bm = set(s._exact_rows(q, "bm25s", MODE_ANY)[0].tolist())
+        any_fts = set(s._exact_rows(q, "fts5", MODE_ANY)[0].tolist())
+        assert all_rows <= any_bm, q
+        assert any_bm == any_fts, q
+
+
+def test_any_mode_finds_either_form_of_an_acronym(comments, fake_encoder):
+    from commentsearch.exact import MODE_ALL, MODE_ANY
+
+    s = _searcher(comments, fake_encoder)
+    q = 'elk "public hearing"'
+    assert len(s._exact_rows(q, "fts5", MODE_ALL)[0]) == 0
+    assert len(s._exact_rows(q, "fts5", MODE_ANY)[0]) == 2
+
+
+def test_fts_query_joins_terms_with_or_in_any_mode():
+    from commentsearch.exact import MODE_ALL, MODE_ANY, fts_query, parse_query
+
+    plan = parse_query('PTW "permissible total withdrawal"')
+    assert fts_query(plan, MODE_ALL) == '"ptw" "permissible total withdrawal"'
+    assert fts_query(plan, MODE_ANY) == '"ptw" OR "permissible total withdrawal"'
+
+
+def test_search_any_mode_returns_more_comments(comments, fake_encoder):
+    s = _searcher(comments, fake_encoder)
+    narrow = s.search("elk wells", method="exact", top_k=50, collapse=False, exact_mode="all")
+    wide = s.search("elk wells", method="exact", top_k=50, collapse=False, exact_mode="any")
+    assert len(wide) > len(narrow)

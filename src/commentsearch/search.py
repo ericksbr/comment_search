@@ -17,10 +17,10 @@ import numpy as np
 import pandas as pd
 
 from .dedupe import first_per_group
-from .exact import build_fts, get_stemmer, match_fts, parse_query, passage_hits, StemPostings
+from .exact import MODE_ALL, MODE_ANY, build_fts, get_stemmer, match_fts, parse_query, passage_hits, StemPostings
 
 DEFAULT_RERANKER = "BAAI/bge-reranker-base"
-METHODS = ("rrf", "blend", "dense", "bm25", "exact", "semantic")
+METHODS = ("rrf", "blend", "dense", "bm25", "exact", "semantic", "sentence")
 DISPLAY_META = ["commenter_name", "group_label", "family_id", "file", "date"]
 
 _STOP = frozenset(
@@ -185,6 +185,12 @@ class Searcher:
         self._s_row = sents["comment_row"].to_numpy() if sents is not None else None
         self._s_text = sents["text"].to_numpy() if sents is not None else None
         self._s_emb = index.sent_emb if sents is not None else None
+        if sents is not None:
+            comment_ids = np.arange(len(self._texts))
+            self._s_start = np.searchsorted(self._s_row, comment_ids, side="left")
+            self._s_end = np.searchsorted(self._s_row, comment_ids, side="right")
+        else:
+            self._s_start = self._s_end = None
 
     @property
     def encoder(self):
@@ -220,6 +226,7 @@ class Searcher:
         pool: int | None = None,
         backend: str = "fts5",
         min_similarity: float = 0.0,
+        exact_mode: str = MODE_ALL,
     ) -> pd.DataFrame:
         """Return the top comments. Per-step timings are in ``df.attrs["timings"]``.
 
@@ -244,9 +251,11 @@ class Searcher:
         t = lap("filter", t0)
 
         if method == "exact":
-            return self._search_exact(query, backend, cmask, top_k, collapse, timings, t0)
+            return self._search_exact(query, backend, cmask, top_k, collapse, timings, t0, exact_mode)
         if method == "semantic":
             return self._search_semantic(query, min_similarity, pmask, cmask, top_k, collapse, timings, t0)
+        if method == "sentence":
+            return self._search_sentence(query, min_similarity, cmask, top_k, collapse, timings, t0)
 
         terms = query_terms(query)
         pool = pool or max(200, top_k * 10)
@@ -347,17 +356,17 @@ class Searcher:
 
     # ------------------------------------------------------------ exact and semantic
 
-    def _exact_rows(self, query: str, backend: str) -> tuple[np.ndarray, np.ndarray, dict]:
+    def _exact_rows(self, query: str, backend: str, mode: str = MODE_ALL) -> tuple[np.ndarray, np.ndarray, dict]:
         """Comment rows that match, their scores (higher is better), and the parsed query."""
         plan = parse_query(query)
         if backend == "fts5":
             if self._fts is None:
                 self._fts = build_fts(self._texts)
-            rows, scores = match_fts(self._fts, plan)
+            rows, scores = match_fts(self._fts, plan, mode)
         elif backend == "bm25s":
             if self._postings is None:
                 self._postings = StemPostings(self._texts)
-            rows = self._postings.match(plan)
+            rows = self._postings.match(plan, mode)
             scores = self._bm25_comment_scores(plan, rows)
         else:
             raise ValueError("backend must be 'fts5' or 'bm25s'")
@@ -373,9 +382,9 @@ class Searcher:
         np.maximum.at(per_comment, self._p_row, passage_scores)
         return per_comment[rows]
 
-    def _search_exact(self, query, backend, cmask, top_k, collapse, timings, t0):
+    def _search_exact(self, query, backend, cmask, top_k, collapse, timings, t0, mode=MODE_ALL):
         t = time.perf_counter()
-        rows, scores, plan = self._exact_rows(query, backend)
+        rows, scores, plan = self._exact_rows(query, backend, mode)
         keep = cmask[rows]
         rows, scores = rows[keep], scores[keep]
         order = np.lexsort((rows, -scores))
@@ -416,6 +425,38 @@ class Searcher:
             ordered.append(row)
         return self._frame(ordered, best, terms, cmask, collapse, top_k, timings, t0, "semantic",
                            plan={"min_similarity": float(min_similarity), "query": query})
+
+    def _search_sentence(self, query, min_similarity, cmask, top_k, collapse, timings, t0):
+        """Comments with at least one sentence at or above min_similarity. Score = best sentence."""
+        terms = query_terms(query)
+        if not query.strip() or self._s_emb is None or self._s_row.size == 0:
+            return self._empty(terms, timings, t0)
+        q_vec = self.encoder.encode_query(query)
+        sims = np.asarray(self._s_emb @ q_vec, dtype=np.float64)
+        sims = np.where(cmask[self._s_row], sims, -np.inf)
+        best = np.full(len(self._texts), -np.inf)
+        np.maximum.at(best, self._s_row, sims)
+        rows = np.flatnonzero(best >= min_similarity)
+        rows = rows[np.argsort(-best[rows], kind="stable")]
+        best_map: dict[int, tuple[int, float]] = {}
+        ordered: list[int] = []
+        for row in rows.tolist():
+            lo, hi = int(self._s_start[row]), int(self._s_end[row])
+            top_sentence = str(self._s_text[lo + int(np.argmax(sims[lo:hi]))])
+            best_map[row] = (self._sentence_passage(row, top_sentence, q_vec), float(best[row]))
+            ordered.append(row)
+        return self._frame(ordered, best_map, terms, cmask, collapse, top_k, timings, t0, "sentence",
+                           plan={"min_similarity": float(min_similarity), "query": query})
+
+    def _sentence_passage(self, row: int, sentence: str, q_vec) -> int:
+        """The passage that contains the sentence (so the Passage view shows it). Falls back to the closest passage."""
+        pids = self._row_pids[row]
+        norm = " ".join(sentence.split())
+        for pid in pids.tolist():
+            if norm in " ".join(str(self._p_text[pid]).split()):
+                return int(pid)
+        scores = np.asarray(self.index.passage_emb[pids] @ q_vec)
+        return int(pids[int(np.argmax(scores))])
 
     def _frame(self, ordered, best, terms, cmask, collapse, top_k, timings, t0, method, plan=None):
         """Turn the chosen passage per comment into the results table (one row per comment)."""

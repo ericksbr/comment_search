@@ -35,6 +35,22 @@ def detect_date_column(df: pd.DataFrame) -> str | None:
     return None
 
 
+_NAME_PREFERRED = ["commenter_name", "Commenter Name", "Name", "Full Name"]
+_NOT_A_PERSON = ("file", "group", "label", "agency", "organization", "org", "filename", "user")
+
+
+def detect_name_column(df: pd.DataFrame) -> str | None:
+    """A column that holds the commenter's name, if one looks like it. Returns None otherwise."""
+    for name in _NAME_PREFERRED:
+        if name in df.columns:
+            return name
+    for col in df.columns:
+        low = col.lower()
+        if "name" in low and not any(word in low for word in _NOT_A_PERSON):
+            return col
+    return None
+
+
 def detect_group_column(df: pd.DataFrame) -> str | None:
     """Grouper's group column, if present."""
     if "group_id" in df.columns:
