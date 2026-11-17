@@ -8,6 +8,9 @@ Open `notebooks/quickstart.ipynb` from the Colab badge in that file. The first c
 
 ## Run it locally
 
+Search a saved index from the terminal: see [RUN_THE_SEARCH.md](RUN_THE_SEARCH.md).
+
+
 ```bash
 pip install -e ".[test]"
 python -m pytest -q        # no model downloads: the tests use a fake encoder

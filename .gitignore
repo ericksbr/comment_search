@@ -10,3 +10,7 @@ __pycache__/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Saved search indexes and their zips (built from comment data)
+comment_indexes/
+*_search-index.zip
