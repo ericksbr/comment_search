@@ -11,7 +11,7 @@ import pandas as pd
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
-_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_PUNKT = None
 _BOILERPLATE_RE = re.compile(
     r"\b(?:see|refer to|review)\s+(?:the\s+|our\s+|my\s+)?(?:attached|attachment|enclosed)\b"
     r"|\battached\s+(?:comments?|letters?|files?|documents?|testimony|statements?)\b",
@@ -50,8 +50,24 @@ def flag_boilerplate(text: str, max_words: int = 60) -> bool:
     return n_words <= max_words and _BOILERPLATE_RE.search(text) is not None
 
 
+def _punkt():
+    """NLTK's Punkt sentence tokenizer (punkt_tab), the same one the Preparer and Grouper notebooks use."""
+    global _PUNKT
+    if _PUNKT is None:
+        import nltk
+        from nltk.tokenize import PunktTokenizer
+
+        try:
+            nltk.data.find("tokenizers/punkt_tab")
+        except LookupError:
+            nltk.download("punkt_tab", quiet=True)
+        _PUNKT = PunktTokenizer()
+    return _PUNKT
+
+
 def split_sentences(text: str) -> list[str]:
-    return [s for s in _SENT_SPLIT_RE.split(text) if s.strip()]
+    """Sentences of a comment, split with NLTK Punkt (handles abbreviations such as 'Dr.' and 'U.S.')."""
+    return [s.strip() for s in _punkt().tokenize(text or "") if s.strip()]
 
 
 def chunk_text(text: str, target_words: int = 250, overlap_words: int = 50) -> list[str]:

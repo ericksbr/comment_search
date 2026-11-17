@@ -69,21 +69,34 @@ def test_hits_table_empty_frame_keeps_columns(comments):
 
 
 def test_detail_shows_selected_hit_in_each_mode(comments, fake_encoder):
-    from commentsearch.app import detail_html, meta_columns
+    from commentsearch.app import MATCH_EXACT, detail_html, meta_columns, search_comments
 
     s = _searcher(comments, fake_encoder)
-    frame = s.search("ranchers economic", top_k=3, method="rrf", collapse=False)
+    frame = search_comments(s, "economic ranchers", MATCH_EXACT, collapse=False, min_similarity=0.6)
     text_by_id = dict(zip(comments["comment_id"], comments["text"]))
     cols = meta_columns(comments)
-    terms = frame.attrs["query_terms"]
     row = 0
-    passage_html = detail_html(frame, row, "Passage", terms, text_by_id, cols)
-    full_html = detail_html(frame, row, "Full comment", terms, text_by_id, cols)
-    excerpt_html = detail_html(frame, row, "Excerpt", terms, text_by_id, cols)
-    assert "<mark>" in passage_html
+    passage_html = detail_html(frame, row, "Passage", text_by_id, cols)
+    full_html = detail_html(frame, row, "Full comment", text_by_id, cols)
+    excerpt_html = detail_html(frame, row, "Excerpt", text_by_id, cols)
+    assert 'class="cs-exact"' in passage_html
     assert frame.iloc[row]["comment_id"] in passage_html
     assert len(full_html) >= len(excerpt_html) >= 0
-    assert "Click a row" in detail_html(None, None, "Passage", terms, text_by_id, cols)
+    assert "Click a row" in detail_html(None, None, "Passage", text_by_id, cols)
+
+
+def test_fuzzy_detail_shades_similar_sentences_blue(comments, fake_encoder):
+    from commentsearch.app import MATCH_FUZZY, detail_html, meta_columns, search_comments
+
+    s = _searcher(comments, fake_encoder)
+    frame = search_comments(s, "economic impacts ranchers", MATCH_FUZZY, collapse=False, min_similarity=0.2)
+    assert not frame.empty
+    row = 0
+    sims = s.sentence_similarities(frame.attrs["plan"]["query"], [int(frame.attrs["rows"][row])])
+    text_by_id = dict(zip(comments["comment_id"], comments["text"]))
+    html_out = detail_html(frame, row, "Full comment", text_by_id, meta_columns(comments), sims[int(frame.attrs["rows"][row])])
+    assert 'class="cs-sent"' in html_out
+    assert "similarity" in html_out
 
 
 def test_show_modes_run_shortest_to_longest():
@@ -120,11 +133,27 @@ def test_table_columns_choice_keeps_rank_and_file_order(comments, fake_encoder):
     assert list(everything.columns) == list(table.columns)
 
 
-def test_min_score_cut_renumbers_ranks(comments, fake_encoder):
-    from commentsearch.app import apply_min_score
+def test_exact_match_returns_every_comment_with_a_query_word(comments, fake_encoder):
+    from commentsearch.app import MATCH_EXACT, search_comments
 
     s = _searcher(comments, fake_encoder)
-    frame = s.search("ranchers economic wells", top_k=5, method="rrf", collapse=False)
-    cut = apply_min_score(frame, frame["score"].max())
-    assert len(cut) >= 1 and list(cut["rank"]) == list(range(1, len(cut) + 1))
-    assert apply_min_score(frame, None) is frame
+    frame = search_comments(s, "ranchers", MATCH_EXACT, collapse=False, min_similarity=0.6)
+    expected = comments["text"].str.contains("ranchers", case=False).sum()
+    assert len(frame) == expected
+    assert list(frame["rank"]) == list(range(1, len(frame) + 1))
+
+
+def test_fuzzy_match_keeps_only_results_at_or_above_cutoff(comments, fake_encoder):
+    from commentsearch.app import MATCH_FUZZY, search_comments
+
+    s = _searcher(comments, fake_encoder)
+    frame = search_comments(s, "ranchers economic wells", MATCH_FUZZY, collapse=False, min_similarity=0.3)
+    assert (frame["score"] >= 0.3).all()
+
+
+def test_app_builds_with_exact_and_fuzzy_choice(comments, fake_encoder):
+    from commentsearch.app import MATCH_EXACT, MATCH_FUZZY, make_app
+
+    demo = make_app(_searcher(comments, fake_encoder))
+    assert demo is not None
+    assert MATCH_EXACT != MATCH_FUZZY

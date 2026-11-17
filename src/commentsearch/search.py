@@ -1,4 +1,11 @@
-"""Retrieval: dense cosine, BM25, fusion (RRF or min-max blend), optional rerank, roll-up, collapse."""
+"""Retrieval.
+
+Two methods serve the search window:
+- ``exact``: every word (stemmed) must appear, quoted phrases in order. Engine: ``fts5`` or ``bm25s``.
+- ``semantic``: passages whose embedding is at least ``min_similarity`` (cosine) from the query.
+
+The older fusion methods (``rrf``, ``blend``, ``dense``, ``bm25``) are kept for tests and comparisons.
+"""
 
 from __future__ import annotations
 
@@ -10,9 +17,10 @@ import numpy as np
 import pandas as pd
 
 from .dedupe import first_per_group
+from .exact import build_fts, get_stemmer, match_fts, parse_query, passage_hits, StemPostings
 
 DEFAULT_RERANKER = "BAAI/bge-reranker-base"
-METHODS = ("rrf", "blend", "dense", "bm25")
+METHODS = ("rrf", "blend", "dense", "bm25", "exact", "semantic")
 DISPLAY_META = ["commenter_name", "group_label", "family_id", "file", "date"]
 
 _STOP = frozenset(
@@ -153,7 +161,7 @@ class Searcher:
     """Search a :class:`commentsearch.index.CommentIndex`.
 
     ``encoder`` defaults to the model named in the index metadata. The reranker is loaded
-    the first time ``rerank=True`` is used.
+    the first time ``rerank=True`` is used. Keyword engines are built the first time they are used.
     """
 
     def __init__(self, index, encoder=None, reranker_name: str = DEFAULT_RERANKER):
@@ -166,6 +174,17 @@ class Searcher:
         self._p_chunk = index.passages["chunk_idx"].to_numpy()
         self._labels = index.comments["dup_group"].to_numpy()
         self._meta_cols = [c for c in index.comments.columns if c not in _SKIP_META]
+        self._texts = index.comments["text"].tolist()
+        # Passage ids of each comment, in one array per comment.
+        order = np.argsort(self._p_row, kind="stable")
+        counts = np.bincount(self._p_row, minlength=len(self._texts))
+        self._row_pids = np.split(order, np.cumsum(counts)[:-1])
+        self._postings: StemPostings | None = None
+        self._fts = None
+        sents = index.sentences
+        self._s_row = sents["comment_row"].to_numpy() if sents is not None else None
+        self._s_text = sents["text"].to_numpy() if sents is not None else None
+        self._s_emb = index.sent_emb if sents is not None else None
 
     @property
     def encoder(self):
@@ -183,6 +202,10 @@ class Searcher:
             self._reranker = CrossEncoder(self.reranker_name)
         return self._reranker
 
+    @property
+    def has_sentences(self) -> bool:
+        return self._s_emb is not None
+
     def search(
         self,
         query: str,
@@ -195,12 +218,16 @@ class Searcher:
         rerank_top: int = 50,
         rrf_k: int = 60,
         pool: int | None = None,
+        backend: str = "fts5",
+        min_similarity: float = 0.0,
     ) -> pd.DataFrame:
         """Return the top comments. Per-step timings are in ``df.attrs["timings"]``.
 
         Filters are applied before ranking. Each comment is scored by its best passage.
         With ``collapse=True`` only the best-ranked comment of each duplicate group is shown,
         and ``search_group_size`` counts the group members that pass the filters.
+        ``method="exact"`` uses ``backend`` ("fts5" or "bm25s"); ``method="semantic"`` keeps passages
+        with cosine similarity >= ``min_similarity``.
         """
         if method not in METHODS:
             raise ValueError(f"method must be one of {METHODS}")
@@ -215,6 +242,12 @@ class Searcher:
         cmask = filter_mask(self.index.comments, filters)
         pmask = cmask[self._p_row]
         t = lap("filter", t0)
+
+        if method == "exact":
+            return self._search_exact(query, backend, cmask, top_k, collapse, timings, t0)
+        if method == "semantic":
+            return self._search_semantic(query, min_similarity, pmask, cmask, top_k, collapse, timings, t0)
+
         terms = query_terms(query)
         pool = pool or max(200, top_k * 10)
         empty = self._empty(terms, timings, t0)
@@ -270,15 +303,128 @@ class Searcher:
             best[row] = (int(pid), float(score))
             ordered.append(row)
         t = lap("roll_up", t)
+        return self._frame(ordered, best, terms, cmask, collapse, top_k, timings, t0, method)
 
+    def compare(self, query: str, top_k: int = 10, filters: dict | None = None, collapse: bool = True) -> dict[str, pd.DataFrame]:
+        """Dense only, BM25 only, hybrid (RRF) and hybrid + rerank, for side-by-side viewing."""
+        return {
+            "dense": self.search(query, top_k, method="dense", collapse=collapse, filters=filters),
+            "bm25": self.search(query, top_k, method="bm25", collapse=collapse, filters=filters),
+            "hybrid": self.search(query, top_k, method="rrf", collapse=collapse, filters=filters),
+            "hybrid+rerank": self.search(query, top_k, method="rrf", rerank=True, collapse=collapse, filters=filters),
+        }
+
+    def compare_exact(self, query: str, show: int = 50) -> dict:
+        """Which comments each exact engine finds for the same query, and the ones only one engine finds."""
+        rows_fts = set(self._exact_rows(query, "fts5")[0].tolist())
+        rows_bm = set(self._exact_rows(query, "bm25s")[0].tolist())
+        ids = self.index.comments["comment_id"].to_numpy()
+
+        def names(rows):
+            return [str(ids[r]) for r in sorted(rows)[:show]]
+
+        return {
+            "fts5": len(rows_fts),
+            "bm25s": len(rows_bm),
+            "both": len(rows_fts & rows_bm),
+            "only_fts5": names(rows_fts - rows_bm),
+            "only_bm25s": names(rows_bm - rows_fts),
+            "only_fts5_count": len(rows_fts - rows_bm),
+            "only_bm25s_count": len(rows_bm - rows_fts),
+        }
+
+    def sentence_similarities(self, query: str, comment_rows) -> dict[int, list[tuple[str, float]]]:
+        """Cosine similarity of each sentence of the given comments to the query, in comment order."""
+        if self._s_emb is None or len(comment_rows) == 0:
+            return {}
+        q_vec = self.encoder.encode_query(query)
+        idx = np.flatnonzero(np.isin(self._s_row, np.asarray(list(comment_rows), dtype=np.int64)))
+        scores = np.asarray(self._s_emb[idx] @ q_vec, dtype=np.float64)
+        out: dict[int, list[tuple[str, float]]] = {}
+        for i, s in zip(idx, scores):
+            out.setdefault(int(self._s_row[i]), []).append((str(self._s_text[i]), float(s)))
+        return out
+
+    # ------------------------------------------------------------ exact and semantic
+
+    def _exact_rows(self, query: str, backend: str) -> tuple[np.ndarray, np.ndarray, dict]:
+        """Comment rows that match, their scores (higher is better), and the parsed query."""
+        plan = parse_query(query)
+        if backend == "fts5":
+            if self._fts is None:
+                self._fts = build_fts(self._texts)
+            rows, scores = match_fts(self._fts, plan)
+        elif backend == "bm25s":
+            if self._postings is None:
+                self._postings = StemPostings(self._texts)
+            rows = self._postings.match(plan)
+            scores = self._bm25_comment_scores(plan, rows)
+        else:
+            raise ValueError("backend must be 'fts5' or 'bm25s'")
+        return rows, scores, plan
+
+    def _bm25_comment_scores(self, plan: dict, rows: np.ndarray) -> np.ndarray:
+        """Best passage BM25 score per comment, for the given rows."""
+        words = plan["loose"] + [w for p in plan["phrases"] for w in p]
+        if not words or rows.size == 0:
+            return np.zeros(len(rows), dtype=np.float64)
+        passage_scores = self._bm25_scores(" ".join(words), np.ones(len(self._p_row), dtype=bool))
+        per_comment = np.zeros(len(self._texts), dtype=np.float64)
+        np.maximum.at(per_comment, self._p_row, passage_scores)
+        return per_comment[rows]
+
+    def _search_exact(self, query, backend, cmask, top_k, collapse, timings, t0):
+        t = time.perf_counter()
+        rows, scores, plan = self._exact_rows(query, backend)
+        keep = cmask[rows]
+        rows, scores = rows[keep], scores[keep]
+        order = np.lexsort((rows, -scores))
+        rows = rows[order]
+        timings[f"{backend}_match"] = round(time.perf_counter() - t, 4)
+        terms = plan["loose"] + [w for p in plan["phrases"] for w in p]
+        best: dict[int, tuple[int, float]] = {}
+        ordered: list[int] = []
+        score_of = dict(zip(rows.tolist(), scores[order].tolist()))
+        for row in rows.tolist():
+            pids = self._row_pids[row]
+            if pids.size == 0:
+                continue
+            hits = [passage_hits(str(self._p_text[p]), plan) for p in pids]
+            pid = int(pids[int(np.argmax(hits))])
+            best[row] = (pid, float(score_of[row]))
+            ordered.append(row)
+        frame = self._frame(ordered, best, terms, cmask, collapse, top_k, timings, t0, "exact", plan=plan)
+        return frame
+
+    def _search_semantic(self, query, min_similarity, pmask, cmask, top_k, collapse, timings, t0):
+        t = time.perf_counter()
+        terms = query_terms(query)
+        if not query.strip() or not pmask.any():
+            return self._empty(terms, timings, t0)
+        q_vec = self.encoder.encode_query(query)
+        timings["encode_query"] = round(time.perf_counter() - t, 4)
+        s_dense = np.where(pmask, np.asarray(self.index.passage_emb, dtype=np.float32) @ q_vec, -np.inf)
+        ids = np.flatnonzero(s_dense >= min_similarity)
+        ids = ids[np.argsort(-s_dense[ids], kind="stable")]
+        best: dict[int, tuple[int, float]] = {}
+        ordered: list[int] = []
+        for pid in ids:
+            row = int(self._p_row[pid])
+            if row in best:
+                continue
+            best[row] = (int(pid), float(s_dense[pid]))
+            ordered.append(row)
+        return self._frame(ordered, best, terms, cmask, collapse, top_k, timings, t0, "semantic",
+                           plan={"min_similarity": float(min_similarity), "query": query})
+
+    def _frame(self, ordered, best, terms, cmask, collapse, top_k, timings, t0, method, plan=None):
+        """Turn the chosen passage per comment into the results table (one row per comment)."""
         if collapse:
             ordered = first_per_group(ordered, self._labels)
         ordered = ordered[:top_k]
         group_counts = np.bincount(self._labels[cmask], minlength=int(self._labels.max()) + 1)
-        t = lap("collapse", t)
-
         if not ordered:
-            return empty
+            return self._empty(terms, timings, t0)
         passage_ids = [best[r][0] for r in ordered]
         frame = pd.DataFrame(
             {
@@ -294,17 +440,16 @@ class Searcher:
         meta = self.index.comments.iloc[ordered][self._meta_cols].reset_index(drop=True)
         frame = pd.concat([frame, meta], axis=1)
         timings["total"] = round(time.perf_counter() - t0, 4)
-        frame.attrs.update({"timings": timings, "query_terms": terms, "method": method})
+        frame.attrs.update(
+            {
+                "timings": timings,
+                "query_terms": terms,
+                "method": method,
+                "rows": np.asarray(ordered, dtype=np.int64),
+                "plan": plan or {},
+            }
+        )
         return frame
-
-    def compare(self, query: str, top_k: int = 10, filters: dict | None = None, collapse: bool = True) -> dict[str, pd.DataFrame]:
-        """Dense only, BM25 only, hybrid (RRF) and hybrid + rerank, for side-by-side viewing."""
-        return {
-            "dense": self.search(query, top_k, method="dense", collapse=collapse, filters=filters),
-            "bm25": self.search(query, top_k, method="bm25", collapse=collapse, filters=filters),
-            "hybrid": self.search(query, top_k, method="rrf", collapse=collapse, filters=filters),
-            "hybrid+rerank": self.search(query, top_k, method="rrf", rerank=True, collapse=collapse, filters=filters),
-        }
 
     # ------------------------------------------------------------ internals
 
@@ -312,7 +457,7 @@ class Searcher:
         import bm25s
 
         retriever = self.index.bm25
-        tokens = bm25s.tokenize([query], stopwords="en", return_ids=False, show_progress=False)[0]
+        tokens = bm25s.tokenize([query], stopwords="en", stemmer=get_stemmer(), return_ids=False, show_progress=False)[0]
         vocab = getattr(retriever, "vocab_dict", None) or {}
         tokens = [tok for tok in tokens if tok in vocab]
         if not tokens:
@@ -324,5 +469,5 @@ class Searcher:
         timings["total"] = round(time.perf_counter() - t0, 4)
         cols = ["rank", "score", "comment_id", "snippet", "passage", "chunk_idx", "search_group_size", *self._meta_cols]
         frame = pd.DataFrame(columns=cols)
-        frame.attrs.update({"timings": timings, "query_terms": terms})
+        frame.attrs.update({"timings": timings, "query_terms": terms, "rows": np.array([], dtype=np.int64), "plan": {}})
         return frame

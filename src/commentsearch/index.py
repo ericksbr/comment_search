@@ -19,6 +19,7 @@ DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 # BGE retrieval models expect this prefix on queries (not on passages).
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 EMB_FILE = "passage_emb.npy"
+SENT_EMB_FILE = "sentence_emb.npy"
 PROGRESS_FILE = "passage_emb.progress.json"
 
 
@@ -123,10 +124,31 @@ def mean_by_comment(emb, comment_row: np.ndarray, n_comments: int) -> np.ndarray
 def build_bm25(texts: list[str]):
     import bm25s
 
-    tokens = bm25s.tokenize(texts, stopwords="en", show_progress=False)
+    from .exact import get_stemmer
+
+    tokens = bm25s.tokenize(texts, stopwords="en", stemmer=get_stemmer(), show_progress=False)
     retriever = bm25s.BM25()
     retriever.index(tokens, show_progress=False)
     return retriever
+
+
+def make_sentences(comments: pd.DataFrame) -> pd.DataFrame:
+    """Every sentence of every comment, split with NLTK Punkt. Sentences stay in comment order."""
+    from .ingest import split_sentences
+
+    rows, sent_idx, texts = [], [], []
+    for row, text in enumerate(comments["text"].tolist()):
+        for j, sentence in enumerate(split_sentences(text)):
+            rows.append(row)
+            sent_idx.append(j)
+            texts.append(sentence)
+    return pd.DataFrame(
+        {
+            "comment_row": np.asarray(rows, dtype=np.int64),
+            "sent_idx": np.asarray(sent_idx, dtype=np.int64),
+            "text": texts,
+        }
+    )
 
 
 @dataclass
@@ -138,6 +160,8 @@ class CommentIndex:
     bm25: object                    # bm25s.BM25
     meta: dict
     timings: dict = field(default_factory=dict)
+    sentences: pd.DataFrame | None = None   # comment_row, sent_idx, text; None for indexes built before sentences
+    sent_emb: np.ndarray | None = None      # (n_sentences, dim), normalized
 
     @property
     def encoder_name(self) -> str:
@@ -175,6 +199,14 @@ class CommentIndex:
         t = lap("embed", t)
         bm25 = build_bm25(texts)
         t = lap("bm25_index", t)
+        sentences = make_sentences(comments)
+        sent_texts = sentences["text"].tolist()
+        sent_emb = (
+            encoder.encode(sent_texts, batch_size=batch_size, show_progress=show_progress)
+            if sent_texts
+            else np.zeros((0, encoder.dim), dtype=np.float32)
+        )
+        t = lap("sentence_embed", t)
         comment_emb = mean_by_comment(emb, passages["comment_row"].to_numpy(), len(comments))
         t = lap("comment_mean_emb", t)
         group_values = comments[group_col].to_numpy() if group_col else None
@@ -192,6 +224,9 @@ class CommentIndex:
             "group_col": group_col,
             "n_comments": int(len(comments)),
             "n_passages": int(len(passages)),
+            "n_sentences": int(len(sentences)),
+            "stemmer": "Porter (original algorithm, NLTK)",
+            "sentence_splitter": "NLTK Punkt (punkt_tab), passages and sentences",
             "dedupe_pairs": pair_stats,
             "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
@@ -203,6 +238,8 @@ class CommentIndex:
             bm25=bm25,
             meta=meta,
             timings=timings,
+            sentences=sentences,
+            sent_emb=sent_emb,
         )
 
     # ------------------------------------------------------------ save / load
@@ -218,6 +255,9 @@ class CommentIndex:
         else:
             np.save(target, np.asarray(self.passage_emb, dtype=np.float32))
         np.save(folder / "comment_emb.npy", np.asarray(self.comment_emb, dtype=np.float32))
+        if self.sentences is not None and self.sent_emb is not None:
+            self.sentences.to_parquet(folder / "sentences.parquet", index=False)
+            np.save(folder / SENT_EMB_FILE, np.asarray(self.sent_emb, dtype=np.float32))
         self.bm25.save(str(folder / "bm25"), show_progress=False)
         (folder / "meta.json").write_text(json.dumps(self.meta, indent=2), encoding="utf-8")
         return folder
@@ -228,6 +268,7 @@ class CommentIndex:
 
         folder = Path(folder)
         meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+        has_sentences = (folder / SENT_EMB_FILE).exists() and (folder / "sentences.parquet").exists()
         return cls(
             comments=pd.read_parquet(folder / "comments.parquet"),
             passages=pd.read_parquet(folder / "passages.parquet"),
@@ -235,4 +276,6 @@ class CommentIndex:
             comment_emb=np.load(folder / "comment_emb.npy"),
             bm25=bm25s.BM25.load(str(folder / "bm25"), load_corpus=False, show_progress=False),
             meta=meta,
+            sentences=pd.read_parquet(folder / "sentences.parquet") if has_sentences else None,
+            sent_emb=np.load(folder / SENT_EMB_FILE) if has_sentences else None,
         )
