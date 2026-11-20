@@ -15,6 +15,7 @@ dependencies = [
     "scipy",
     "sentence-transformers",
     "bm25s",
+    "nltk",
     "gradio",
 ]
 

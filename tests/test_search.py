@@ -36,7 +36,7 @@ def test_search_returns_one_row_per_comment_with_metadata(comments, fake_encoder
     frame = Searcher(index, encoder=fake_encoder).search("ranchers economic", top_k=5, method="rrf", collapse=False)
     assert frame["comment_id"].is_unique
     assert frame.iloc[0]["comment_id"] == "A-2"
-    assert {"rank", "score", "comment_id", "snippet", "group_size", "commenter_name"} <= set(frame.columns)
+    assert {"rank", "score", "comment_id", "snippet", "search_group_size", "commenter_name"} <= set(frame.columns)
     assert "timings" in frame.attrs and "total" in frame.attrs["timings"]
 
 
@@ -75,7 +75,7 @@ def test_collapse_shows_one_representative_per_group(fake_encoder):
     shown = s.search("ranchers economic loss", top_k=5, method="rrf", collapse=True)
     assert len(shown) == 2
     rep = shown.iloc[0]
-    assert rep["group_size"] == 2
+    assert rep["search_group_size"] == 2
     raw_shown = s.search("ranchers economic loss", top_k=5, method="rrf", collapse=False)
     assert len(raw_shown) == 3
 
