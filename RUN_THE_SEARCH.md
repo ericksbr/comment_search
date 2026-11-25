@@ -4,7 +4,7 @@ This guide covers the comment search on your own computer: where the saved index
 
 ## 1. The saved index zip
 
-Each dataset is built in the notebook (`notebooks/quickstart.ipynb`). Step 3b offers a download named `<file>_search-index.zip`. Keep these rules:
+Each dataset is built in the notebook (`notebooks/comment_search.ipynb`). Step 3b offers a download named `<file>_search-index.zip`. Keep these rules:
 
 - **Store the zip in the index folder** (or anywhere you like) and unzip it there. The index folder is:
   `C:\Users\ericksbr\Box\Coding\comment_indexes`

@@ -58,7 +58,7 @@ By default, the list shows every hit. Tick **One per duplicate group** to show o
 
 ## Run it in Colab
 
-Open `notebooks/quickstart.ipynb` from the Colab badge in that file. The first code cells install the package from this repository (branch `main`) and connect Google Drive, where the index is saved by default. Then edit the file path and column names in the settings cell.
+Open `notebooks/comment_search.ipynb` from the Colab badge in that file. The first code cells install the package from this repository (branch `main`) and connect Google Drive, where the index is saved by default. Then edit the file path and column names in the settings cell.
 
 ## Run it locally
 
@@ -69,7 +69,7 @@ pip install -e ".[test]"
 python -m pytest -q        # no model downloads: the tests use a fake encoder
 ```
 
-To run the notebook on your own computer, set `COMMENTS_PATH` (the comments file) and `COMMENTSEARCH_INDEX_DIR` (where the index is saved). The notebook reads them if they are set, and it uses `COMMENTS_PATH` for local testing. Open `notebooks/quickstart.ipynb` with Jupyter.
+To run the notebook on your own computer, set `COMMENTS_PATH` (the comments file) and `COMMENTSEARCH_INDEX_DIR` (where the index is saved). The notebook reads them if they are set, and it uses `COMMENTS_PATH` for local testing. Open `notebooks/comment_search.ipynb` with Jupyter.
 
 ## Index folder
 

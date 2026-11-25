@@ -11,7 +11,7 @@ Everything runs on your own computer. Comment text is not sent to any outside se
 
 ## Using the notebook
 
-`notebooks/quickstart.ipynb` runs top to bottom in Colab:
+`notebooks/comment_search.ipynb` runs top to bottom in Colab:
 
 1. **Act 1 (build):** loads your file, lets you choose the text, ID, and commenter-name columns, and builds the search index. This is the slow step, and it uses the GPU for the meaning part.
 2. **Save:** the index is saved to a folder, and a zip is offered for download.
