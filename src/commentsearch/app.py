@@ -5,6 +5,7 @@ import html
 import os
 import re
 import tempfile
+from datetime import datetime
 
 import pandas as pd
 
@@ -410,13 +411,17 @@ def split_text(text: str, limit: int = EXCEL_TEXT_LIMIT) -> list[str]:
 _ILLEGAL_XLSX = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
-def export_rows(frame, ids, text_by_id: dict, meta_cols: list[str], roles) -> tuple[list[str], list[list]]:
-    """Headers and rows for the Excel export: the list's columns, then the matched passage and the full text.
-    The full text is split across several columns when it is longer than an Excel cell can hold."""
+def export_rows(frame, ids, text_by_id: dict, meta_cols: list[str], roles,
+                chosen=None) -> tuple[list[str], list[list]]:
+    """Headers and rows for the Excel export: the chosen list columns (all of them if ``chosen`` is None; the
+    comment ID always), then the matched passage and the full text. The full text is split across several
+    columns when it is longer than an Excel cell can hold."""
     keep = selected_rows(frame, ids)
     sub = frame.iloc[keep].reset_index(drop=True)
     sub.attrs = dict(frame.attrs)
     hits = hits_table(sub, meta_cols, roles)
+    if chosen is not None:
+        hits = select_table_columns(hits, chosen)
     passages = [str(p) for p in sub["passage"]] if "passage" in sub.columns else [str(s) for s in sub["snippet"]]
     pieces = [split_text(text_by_id.get(cid, "")) for cid in sub["comment_id"]]
     n_parts = max((len(p) for p in pieces), default=1)
@@ -429,25 +434,62 @@ def export_rows(frame, ids, text_by_id: dict, meta_cols: list[str], roles) -> tu
     return headers, rows
 
 
-def write_xlsx(path: str, headers: list[str], rows: list[list]) -> None:
-    """Write a one-sheet workbook. Text that starts with '=' is kept as text, not run as a formula."""
-    from openpyxl import Workbook
+def _fill_sheet(ws, rows: list[list], bold_first_row: bool) -> None:
+    """Write rows into a sheet. Text that starts with '=' is kept as text, not run as a formula."""
     from openpyxl.styles import Font
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Selected passages"
-    for r_idx, row in enumerate([headers, *rows], start=1):
+    for r_idx, row in enumerate(rows, start=1):
         for c_idx, value in enumerate(row, start=1):
             if isinstance(value, str):
                 value = _ILLEGAL_XLSX.sub("", value)[:EXCEL_TEXT_LIMIT + 767]
             cell = ws.cell(row=r_idx, column=c_idx, value=value)
             if isinstance(value, str) and value.startswith("="):
                 cell.data_type = "s"
-            if r_idx == 1:
+            if bold_first_row and r_idx == 1:
                 cell.font = Font(bold=True)
+
+
+def write_xlsx(path: str, headers: list[str], rows: list[list], info_rows: list[list] | None = None) -> None:
+    """Write the passages to one sheet, and the search settings to a second sheet if given."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Selected passages"
+    _fill_sheet(ws, [headers, *rows], bold_first_row=True)
     ws.freeze_panes = "A2"
+    if info_rows:
+        info = wb.create_sheet("Search info")
+        _fill_sheet(info, info_rows, bold_first_row=True)
+        info.column_dimensions["A"].width = 24
+        info.column_dimensions["B"].width = 90
     wb.save(path)
+
+
+def export_filename(info) -> str:
+    """commentsearch_export_<the search words>.xlsx, with anything but letters and digits replaced by '_'."""
+    query = (info or {}).get("query", "")
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", query).strip("_")[:60]
+    return f"commentsearch_export_{slug}.xlsx" if slug else "commentsearch_export.xlsx"
+
+
+def search_info_rows(info, n_rows: int, ticked: bool) -> list[list]:
+    """The 'Search info' sheet: what was searched, how, when, and what the export holds."""
+    info = info or {}
+    if info.get("match") == MATCH_EXACT:
+        method = "Exact words, " + ("all words" if info.get("exact_mode") == MODE_ALL else "any word")
+    else:
+        unit = "sentence" if info.get("level") == LEVEL_SENTENCE else "passage"
+        method = f"Fuzzy (by meaning), {unit} match, cutoff {float(info.get('cutoff', 0.0)):.2f}"
+    return [
+        ["Setting", "Value"],
+        ["Search", info.get("query", "")],
+        ["Match", method],
+        ["Duplicates", "One per duplicate group" if info.get("collapse") else "Every hit"],
+        ["Search date and time", info.get("time", "")],
+        ["Rows exported", n_rows],
+        ["Rows", "Ticked passages only" if ticked else "All current hits"],
+    ]
 
 
 def make_app(searcher, title: str = "Local comment search"):
@@ -504,8 +546,12 @@ def make_app(searcher, title: str = "Local comment search"):
             detail, position = render(None, None, mode)
             count, strip = selection_text(None, [], name_col)
             return ("Type a word or phrase to search.", table_update(None, [], []), None, gr.update(), None, None,
-                    detail, position, keep_sort, [], count, strip)
+                    detail, position, keep_sort, [], count, strip, None)
         cutoff = cutoffs.get(level, DEFAULT_CUTOFF[level])
+        search_info = {
+            "query": query.strip(), "match": match, "exact_mode": exact_mode, "level": level,
+            "cutoff": float(cutoff), "collapse": bool(collapse), "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
         frame = search_comments(searcher, query, match, bool(collapse), cutoff, level, exact_mode)
         frame = sort_frame(frame, sort_key, bool(descending), date_col)
         if frame.empty:
@@ -545,6 +591,7 @@ def make_app(searcher, title: str = "Local comment search"):
             [],
             count,
             strip,
+            search_info,
         )
 
     with gr.Blocks(title=title, fill_height=True) as demo:
@@ -593,6 +640,7 @@ def make_app(searcher, title: str = "Local comment search"):
         row_state = gr.State(None)
         hits_state = gr.State(None)  # every column of every hit; the list shows a chosen subset
         selected_state = gr.State([])  # comment IDs ticked in the list
+        search_state = gr.State(None)  # the search settings, for the export's file name and 'Search info' sheet
 
         with gr.Row(equal_height=False):
             with gr.Column(scale=2, min_width=300) as left:
@@ -648,7 +696,7 @@ def make_app(searcher, title: str = "Local comment search"):
         inputs = [query, match_state, cutoffs_state, level_state, collapse, show_mode, sort_dd, sort_order,
                   exact_mode_state]
         outputs = [status, hits, frame_state, table_columns, hits_state, row_state, detail, position, sort_dd,
-                   selected_state, sel_count, strip]
+                   selected_state, sel_count, strip, search_state]
         go.click(run, inputs=inputs, outputs=outputs)
         query.submit(run, inputs=inputs, outputs=outputs)
         query.change(run, inputs=inputs, outputs=outputs, trigger_mode="always_last")
@@ -777,18 +825,19 @@ def make_app(searcher, title: str = "Local comment search"):
         hide_btn.click(on_hide, None, [table_panel, strip_panel, left])
         show_btn.click(on_show, None, [table_panel, strip_panel, left])
 
-        def on_export(frame, selected):
+        def on_export(frame, selected, chosen, info):
             if frame is None or len(frame) == 0:
                 return None, "Nothing to export. Run a search first."
             ids = selected or list(frame["comment_id"])
-            headers, rows = export_rows(frame, ids, text_by_id, table_meta, roles)
-            fd, path = tempfile.mkstemp(suffix=".xlsx", prefix="commentsearch_export_")
-            os.close(fd)
-            write_xlsx(path, headers, rows)
+            headers, rows = export_rows(frame, ids, text_by_id, table_meta, roles, chosen or [])
+            folder = tempfile.mkdtemp(prefix="commentsearch_")
+            path = os.path.join(folder, export_filename(info))
+            write_xlsx(path, headers, rows, search_info_rows(info, len(rows), bool(selected)))
             which = "ticked" if selected else "all current"
             return path, f"Exported {len(rows):,} {which} hit(s) to Excel."
 
-        export_btn.click(on_export, [frame_state, selected_state], [export_file, export_note])
+        export_btn.click(on_export, [frame_state, selected_state, table_columns, search_state],
+                         [export_file, export_note])
 
         def on_compare(q):
             if not (q or "").strip():

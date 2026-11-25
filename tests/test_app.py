@@ -349,3 +349,45 @@ def test_excel_export_keeps_full_text_and_formulas_as_text(comments, fake_encode
     assert rebuilt == long_text
     assert all(len(v) <= 32767 for row in ws.iter_rows(values_only=True) for v in row if isinstance(v, str))
     assert ws.cell(row=2, column=full_cols[0] + 1).data_type != "f"  # no formula
+
+
+def test_export_keeps_only_chosen_columns_plus_id_passage_and_text(comments, fake_encoder):
+    from commentsearch.app import LEVEL_PASSAGE, MATCH_EXACT, column_roles, export_rows, meta_columns, search_comments
+
+    s = _searcher(comments, fake_encoder)
+    frame = search_comments(s, "ranchers", MATCH_EXACT, False, 0.6, LEVEL_PASSAGE)
+    text_by_id = dict(zip(comments["comment_id"], comments["text"]))
+    cols = meta_columns(comments)
+    headers, _ = export_rows(frame, list(frame["comment_id"]), text_by_id, cols, column_roles(cols),
+                             ["commenter_name", "date"])
+    assert headers[:3] == ["commenter_name", "comment_id", "date"]
+    assert "group_id" not in headers and "boilerplate" not in headers
+    assert headers[3:5] == ["Matched passage", "Full text"]
+
+
+def test_export_filename_uses_the_search_words():
+    from commentsearch.app import export_filename
+
+    assert export_filename({"query": 'public hearing "wells" 2024!'}) == "commentsearch_export_public_hearing_wells_2024.xlsx"
+    assert export_filename({"query": "  "}) == "commentsearch_export.xlsx"
+    assert export_filename(None) == "commentsearch_export.xlsx"
+
+
+def test_search_info_sheet_records_the_search(tmp_path):
+    from openpyxl import load_workbook
+
+    from commentsearch.app import LEVEL_SENTENCE, MATCH_FUZZY, search_info_rows, write_xlsx
+
+    info = {"query": "economic impacts", "match": MATCH_FUZZY, "exact_mode": "all", "level": LEVEL_SENTENCE,
+            "cutoff": 0.5, "collapse": True, "time": "2026-11-25 10:00"}
+    rows = search_info_rows(info, 3, ticked=True)
+    path = tmp_path / "x.xlsx"
+    write_xlsx(str(path), ["comment_id"], [["A-1"]], rows)
+    wb = load_workbook(path)
+    assert wb.sheetnames == ["Selected passages", "Search info"]
+    values = {r[0].value: r[1].value for r in wb["Search info"].iter_rows()}
+    assert values["Search"] == "economic impacts"
+    assert values["Match"] == "Fuzzy (by meaning), sentence match, cutoff 0.50"
+    assert values["Duplicates"] == "One per duplicate group"
+    assert values["Search date and time"] == "2026-11-25 10:00"
+    assert values["Rows exported"] == 3 and values["Rows"] == "Ticked passages only"
