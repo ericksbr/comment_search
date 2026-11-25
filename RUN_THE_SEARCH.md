@@ -51,7 +51,18 @@ Pick a number (Enter = 1):
 
 Type a number and press Enter. The search opens in your browser. Keep the terminal window open while you search. Press **Ctrl+C** in that window to stop.
 
-The first start takes a few extra seconds while the fuzzy-search model loads. The model is downloaded from Hugging Face the first time only, so the first start needs internet access.
+The first start takes a few extra seconds while the fuzzy-search model loads.
+
+## Using the window
+
+- **Search:** type in the box at the top. Results update as you type. Choose **Exact words** or **Fuzzy (by meaning)** above the box.
+- **Every hit or one per group:** the list shows every hit by default. Tick **One per duplicate group** to show only the best-matching comment from each group of copies.
+- **The list (left):** one row per comment. Name, comment ID, page and date come first. Use **Columns and export** to show or hide other columns.
+- **Picking passages:** tick **Pick** in a row, or use **Select all** / **Select none**. With one or more ticked, the right side shows all of them together, one after another. Clear the selection to go back to browsing one hit at a time with the arrow keys or **Previous** / **Next**.
+- **Hide table:** collapses the list to a narrow panel of the selected commenters' names, so the passages have more room. **Show table** brings the list back.
+- **Export:** open **Columns and export** and press **Export to Excel**. The file holds the ticked passages, or every current hit if none are ticked. Comment text longer than one Excel cell is split across columns named "Full text (part 2)" and so on, so nothing is cut off.
+- **Show (right side):** **Passage** shows the matching part of each comment, and **Full comment** shows the whole comment.
+ The model is downloaded from Hugging Face the first time only, so the first start needs internet access.
 
 ## Options
 

@@ -52,7 +52,8 @@ def test_hits_table_has_id_and_metadata_but_no_rank_or_text(comments, fake_encod
     frame = s.search("ranchers economic", top_k=5, method="rrf", collapse=False)
     cols = meta_columns(comments)
     table = hits_table(frame, cols)
-    assert list(table.columns) == ["comment_id", *cols]  # exact-style list: no similarity column
+    # name first, then comment ID; no similarity column for exact searches
+    assert list(table.columns) == ["commenter_name", "comment_id", "date", *[c for c in cols if c not in ("commenter_name", "date")]]
     assert "commenter_name" in table.columns
     assert "text" not in table.columns and "dup_group" not in table.columns
     assert "excerpt" not in table.columns and "rank" not in table.columns
@@ -76,10 +77,9 @@ def test_detail_shows_selected_hit_in_each_mode(comments, fake_encoder):
     row = 0
     passage_html = detail_html(frame, row, "Passage", text_by_id, cols)
     full_html = detail_html(frame, row, "Full comment", text_by_id, cols)
-    excerpt_html = detail_html(frame, row, "Excerpt", text_by_id, cols)
     assert 'class="cs-exact"' in passage_html
     assert frame.iloc[row]["comment_id"] in passage_html
-    assert len(full_html) >= len(excerpt_html) >= 0
+    assert len(full_html) >= len(passage_html) >= 0
     assert "Click a row" in detail_html(None, None, "Passage", text_by_id, cols)
 
 
@@ -122,7 +122,7 @@ def test_sentence_ranges_ignore_line_breaks_in_the_body():
 def test_show_modes_run_shortest_to_longest():
     from commentsearch.app import SHOW_MODES
 
-    assert SHOW_MODES == ["Excerpt", "Passage", "Full comment"]
+    assert SHOW_MODES == ["Passage", "Full comment"]
 
 
 def test_list_has_no_long_text_so_rows_stay_short(comments, fake_encoder):
@@ -146,9 +146,9 @@ def test_table_columns_choice_keeps_file_order(comments, fake_encoder):
     frame = s.search("ranchers economic", top_k=3, method="rrf", collapse=False)
     table = hits_table(frame, meta_columns(comments))
     defaults = default_table_columns(table)
-    assert defaults[0] == "comment_id" and "excerpt" not in defaults and "rank" not in defaults
+    assert defaults[0] == "commenter_name" and "rank" not in defaults and "text" not in defaults
     picked = select_table_columns(table, ["commenter_name"])
-    assert list(picked.columns) == ["commenter_name"]
+    assert list(picked.columns) == ["commenter_name", "comment_id"]  # the ID always stays
     everything = select_table_columns(table, list(table.columns))
     assert list(everything.columns) == list(table.columns)
 
@@ -159,7 +159,8 @@ def test_similarity_column_appears_for_fuzzy_results(comments, fake_encoder):
     s = _searcher(comments, fake_encoder)
     frame = search_comments(s, "ranchers economic wells", MATCH_FUZZY, False, 0.3, LEVEL_PASSAGE)
     table = hits_table(frame, meta_columns(comments))
-    assert list(table.columns)[:2] == ["similarity", "comment_id"]
+    assert list(table.columns)[:2] == ["commenter_name", "comment_id"]
+    assert list(table.columns).index("similarity") == 3  # after name, ID and date
 
 
 def test_sort_by_comment_id_and_similarity(comments, fake_encoder):
@@ -262,3 +263,89 @@ def test_preview_uses_the_name_column_chosen_at_build(comments, fake_encoder):
     # the user chose (none): only the ID is shown, in bold
     none_out = detail_html(frame, 0, "Passage", text_by_id, meta_columns(comments), None, None)
     assert f"<b>{cid}</b>" in none_out
+
+
+def test_page_and_date_come_right_after_the_name_and_id():
+    from commentsearch.app import hits_table
+
+    frame = pd.DataFrame(
+        {"comment_id": ["C1"], "Page": ["3"], "Commenter Name": ["Ann"], "Date Received": ["2024-01-05"],
+         "file": ["a.pdf"], "Organization": ["Ranch Co"]}
+    )
+    raw = frame.drop(columns=["comment_id"])
+    cols = list(raw.columns)
+    table = hits_table(frame.assign(score=[0.9], rank=[1]).iloc[:0], cols)
+    assert list(table.columns) == ["Commenter Name", "comment_id", "Page", "Date Received", "file", "Organization"]
+
+
+def test_pick_column_is_first_and_ticks_the_selected_ids():
+    from commentsearch.app import PICK, with_pick
+
+    table = pd.DataFrame({"commenter_name": ["Ann", "Bob"], "comment_id": ["A", "B"]})
+    view = with_pick(table, ["B"])
+    assert list(view.columns) == [PICK, "commenter_name", "comment_id"]
+    assert list(view[PICK]) == [False, True]
+    assert list(table.columns) == ["commenter_name", "comment_id"]  # the input is not changed
+
+
+def test_select_all_and_none_and_the_collapsed_name_list(comments, fake_encoder):
+    from commentsearch.app import LEVEL_PASSAGE, MATCH_EXACT, selection_text, search_comments
+
+    s = _searcher(comments, fake_encoder)
+    frame = search_comments(s, "ranchers", MATCH_EXACT, False, 0.6, LEVEL_PASSAGE)
+    ids = list(frame["comment_id"])
+    count, strip = selection_text(frame, ids, "commenter_name")
+    assert f"**{len(ids)} selected**" in count
+    assert "<li>Ann</li>" in strip  # names, not IDs, in the collapsed list
+    none_count, none_strip = selection_text(frame, [], "commenter_name")
+    assert "Nothing selected" in none_count and "<li>" not in none_strip
+
+
+def test_selected_rows_follow_the_list_order(comments, fake_encoder):
+    from commentsearch.app import LEVEL_PASSAGE, MATCH_FUZZY, search_comments, selected_rows
+
+    s = _searcher(comments, fake_encoder)
+    frame = search_comments(s, "ranchers economic wells", MATCH_FUZZY, False, 0.0, LEVEL_PASSAGE)
+    assert len(frame) >= 2
+    ids = list(frame["comment_id"][:2])
+    assert selected_rows(frame, ids) == [0, 1]
+    assert selected_rows(frame, list(reversed(ids))) == [0, 1]  # order of the list, not of the selection
+    assert selected_rows(frame, []) == []
+
+
+def test_split_text_is_lossless_and_under_the_excel_limit():
+    from commentsearch.app import EXCEL_TEXT_LIMIT, split_text
+
+    text = " ".join(f"word{i}" for i in range(20000))  # about 160,000 characters
+    parts = split_text(text)
+    assert len(parts) > 1
+    assert all(len(p) <= EXCEL_TEXT_LIMIT for p in parts)
+    assert "".join(parts) == text
+    assert split_text("short") == ["short"]
+
+
+def test_excel_export_keeps_full_text_and_formulas_as_text(comments, fake_encoder, tmp_path):
+    from openpyxl import load_workbook
+
+    from commentsearch.app import (LEVEL_PASSAGE, MATCH_EXACT, column_roles, export_rows, meta_columns,
+                                   search_comments, write_xlsx)
+
+    s = _searcher(comments, fake_encoder)
+    frame = search_comments(s, "ranchers", MATCH_EXACT, False, 0.6, LEVEL_PASSAGE)
+    long_text = "=HYPERLINK(\"x\") " + " ".join(["economic"] * 9000)  # over one Excel cell
+    text_by_id = dict(zip(comments["comment_id"], comments["text"]))
+    text_by_id[frame.iloc[0]["comment_id"]] = long_text
+    headers, rows = export_rows(frame, list(frame["comment_id"]), text_by_id, meta_columns(comments),
+                                column_roles(meta_columns(comments)))
+    path = tmp_path / "out.xlsx"
+    write_xlsx(str(path), headers, rows)
+
+    ws = load_workbook(path).active
+    assert ws.max_row == len(frame) + 1
+    assert ws.cell(row=1, column=1).value == headers[0]
+    first_row = [c.value for c in ws[2]]
+    full_cols = [i for i, h in enumerate(headers) if h.startswith("Full text")]
+    rebuilt = "".join(first_row[i] or "" for i in full_cols)
+    assert rebuilt == long_text
+    assert all(len(v) <= 32767 for row in ws.iter_rows(values_only=True) for v in row if isinstance(v, str))
+    assert ws.cell(row=2, column=full_cols[0] + 1).data_type != "f"  # no formula

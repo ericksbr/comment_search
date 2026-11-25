@@ -35,6 +35,14 @@ def detect_date_column(df: pd.DataFrame) -> str | None:
     return None
 
 
+def detect_page_column(df: pd.DataFrame) -> str | None:
+    """A column that holds the page number, if one looks like it (e.g. 'Page', 'page_number')."""
+    for col in df.columns:
+        if "page" in col.lower():
+            return col
+    return None
+
+
 _NAME_PREFERRED = ["commenter_name", "Commenter Name", "Name", "Full Name"]
 _NOT_A_PERSON = ("file", "group", "label", "agency", "organization", "org", "filename", "user")
 

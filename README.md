@@ -46,7 +46,7 @@ Building the index is the slow step, because the fingerprints are computed for e
 
 ### Step 6: Showing one result per duplicate group
 
-With "One per duplicate group" checked (the default), the list shows only the highest-ranked comment from each duplicate group. Unchecking it shows every match. The count in the status line depends on this setting.
+By default, the list shows every hit. Tick **One per duplicate group** to show only the highest-ranked comment from each group of copies. Untick it to see every match again. The count in the status line depends on this setting.
 
 ### Limits to keep in mind
 
@@ -58,7 +58,7 @@ With "One per duplicate group" checked (the default), the list shows only the hi
 
 ## Run it in Colab
 
-Open `notebooks/quickstart.ipynb` from the Colab badge in that file. The first code cells install the package from this repository (branch `notebook-acts`) and connect Google Drive, where the index is saved by default. Then edit the file path and column names in the settings cell.
+Open `notebooks/quickstart.ipynb` from the Colab badge in that file. The first code cells install the package from this repository (branch `agency-feedback-ui`) and connect Google Drive, where the index is saved by default. Then edit the file path and column names in the settings cell.
 
 ## Run it locally
 
