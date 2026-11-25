@@ -1,25 +1,24 @@
 """Gradio UI over a Searcher: a query box that updates as you type, exact or fuzzy matching, a hits list with a
-preview panel, and CSV download. Nothing leaves the runtime."""
+preview panel, and selecting passages to view together or export to Excel. Nothing leaves the runtime."""
 
 import html
 import os
 import re
 import tempfile
+from datetime import datetime
 
 import pandas as pd
 
-from .columns import detect_name_column
+from .columns import detect_date_column, detect_name_column, detect_page_column
 from .exact import MODE_ALL, MODE_ANY, highlight_exact
 from .search import highlight
 
 _TABLE_INTERNAL = {"comment_id", "text", "dup_group", "dup_group_size", "boilerplate"}
-EXCERPT_CHARS = 160
-# Shortest to longest, as shown on the right of the table.
-SHOW_MODES = ["Excerpt", "Passage", "Full comment"]
+# Shown on the right of the list.
+SHOW_MODES = ["Passage", "Full comment"]
 SHOW_MODE_INFO = (
-    "Excerpt: about 160 characters around the first matching word. "
-    "Passage: the part of the comment that matched best. "
-    "Full comment: the whole comment text."
+    "Passage: the part of the comment that matched best (about 250 words), with the matching words or "
+    "sentences shaded. Full comment: the whole comment text."
 )
 
 # Exact = every word must appear (stems count), and "quoted phrases" must appear in order.
@@ -54,21 +53,22 @@ SORT_SIM = "Similarity"
 SORT_ID = "Comment ID"
 SORT_DATE = "Date"
 SORT_ORDERS = ["Ascending", "Descending"]
+# The direction each sort key starts with when chosen. Best match and similarity: strongest first.
+# Comment ID: A to Z. Date: newest first.
+DEFAULT_SORT_ORDER = {SORT_BEST: "Descending", SORT_SIM: "Descending", SORT_ID: "Ascending", SORT_DATE: "Descending"}
 
-HOW_TO_TEXT = (
-    "**Exact words:** every word you type must appear in the comment. Word endings are ignored, so "
-    "\"impact\" finds \"impacts\". Put words in quotes to require them in that order.\n\n"
-    "**Fuzzy (by meaning):** finds comments similar in meaning, even without the same words. Choose "
-    "**Sentence match** or **Passage match** to decide what is compared and shaded blue. The cutoff sets how "
-    "close a match must be."
-)
+# The first column of the list: a tick box for picking passages to view together or export.
+PICK = "Pick"
+EXCEL_TEXT_LIMIT = 32000  # Excel allows 32,767 characters per cell; stay under it.
+
 HOW_TO_PLAIN = (
     "Exact words: every word must appear; word endings are ignored ('impact' finds 'impacts'); "
     "quotes require the words in order. Yellow = matched words. "
     "Fuzzy (by meaning): comments similar in meaning, even without the same words. "
     "Sentence match lists comments with a sentence at or above the cutoff and shades those sentences blue. "
     "Passage match lists comments whose best passage is at or above the cutoff and shades that passage blue. "
-    "Arrow keys or j / k move through the hits."
+    "Tick Pick in the list to choose passages. With any ticked, the right side shows them together. "
+    "Columns and export (top left) saves the ticked passages to Excel. Arrow keys or j / k move through the hits."
 )
 
 CARD_CSS = """
@@ -87,6 +87,7 @@ CARD_CSS = """
 .cs-table td, .cs-table th {font-size:12.5px !important;padding:2px 6px !important;line-height:1.25 !important;}
 .cs-table tr.selected td, .cs-table td.selected, .cs-table .selected {background:#e8f1ff !important;box-shadow:none !important;outline:none !important;}
 .cs-position{font-size:13px;color:#57606a;text-align:center;padding-top:8px}
+.cs-strip{font-size:13.5px;padding-left:20px;margin:4px 0;line-height:1.5}
 </style>
 """
 
@@ -149,11 +150,32 @@ def has_score(frame) -> bool:
     return frame is not None and frame.attrs.get("method") in SCORED_METHODS
 
 
-def hits_table(frame: pd.DataFrame, meta_cols: list[str]) -> pd.DataFrame:
-    """One row per hit: similarity (fuzzy searches only), comment ID and the file's metadata columns.
-    The text is shown in the preview, not the list."""
+def column_roles(meta_cols: list[str], name_col: str | None = "auto") -> tuple[str | None, str | None, str | None]:
+    """The commenter name, page and date columns, if the file has them. The name column is the one chosen when
+    the index was built ("auto" means detect it)."""
+    probe = pd.DataFrame(columns=list(meta_cols))
+    name = detect_name_column(probe) if name_col == "auto" else name_col
+    name = name if name in meta_cols else None
+    return name, detect_page_column(probe), detect_date_column(probe)
+
+
+def lead_columns(roles: tuple[str | None, str | None, str | None]) -> list[str]:
+    """The columns that come first in the list and in the export: name, comment ID, page, date."""
+    name, page, date = roles
+    lead = []
+    for col in (name, "comment_id", page, date):
+        if col and col not in lead:
+            lead.append(col)
+    return lead
+
+
+def hits_table(frame: pd.DataFrame, meta_cols: list[str], roles=None) -> pd.DataFrame:
+    """One row per hit: name, comment ID, page and date first, then similarity (fuzzy searches only), then the
+    file's other metadata. The text is shown in the preview, not the list."""
+    roles = column_roles(meta_cols) if roles is None else roles
     scored = has_score(frame)
-    cols = (["similarity"] if scored else []) + ["comment_id", *meta_cols]
+    lead = lead_columns(roles)
+    cols = lead + (["similarity"] if scored else []) + [c for c in meta_cols if c not in lead]
     if frame.empty:
         return pd.DataFrame(columns=cols)
     out = {}
@@ -165,17 +187,33 @@ def hits_table(frame: pd.DataFrame, meta_cols: list[str]) -> pd.DataFrame:
     return pd.DataFrame(out)[cols]
 
 
-def default_table_columns(hits: pd.DataFrame) -> list[str]:
-    """Shown by default: similarity (if any), comment ID, and the first few metadata columns."""
-    cols = list(hits.columns)
-    meta = [c for c in cols if c not in ("similarity", "comment_id")]
-    return [c for c in ("similarity", "comment_id") if c in cols] + meta[:3]
+def default_table_columns(hits: pd.DataFrame, roles=None) -> list[str]:
+    """Shown by default: name, comment ID, page, date and similarity (if any). Other columns can be added."""
+    cols = [c for c in hits.columns if c != PICK]
+    roles = column_roles(cols) if roles is None else roles
+    keep = {"similarity", "comment_id", *(r for r in roles if r)}
+    return [c for c in cols if c in keep]
 
 
 def select_table_columns(hits: pd.DataFrame, chosen) -> pd.DataFrame:
-    """The table with only the chosen columns, in the file's order."""
-    keep = [c for c in hits.columns if c in set(chosen)]
+    """The table with only the chosen columns, in the file's order. The comment ID always stays, so each row
+    can be matched to its passage."""
+    wanted = set(chosen or [])
+    keep = [c for c in hits.columns if c in wanted or c == "comment_id"]
     return hits[keep] if keep else hits
+
+
+def with_pick(table: pd.DataFrame, selected) -> pd.DataFrame:
+    """The table with a Pick column in front: ticked for each comment ID in ``selected``."""
+    chosen = set(selected or [])
+    out = table.copy()
+    out.insert(0, PICK, [bool(cid in chosen) for cid in out["comment_id"]])
+    return out
+
+
+def table_datatypes(view: pd.DataFrame) -> list[str]:
+    """Pick is a tick box; every other column is text."""
+    return ["bool"] + ["str"] * (len(view.columns) - 1)
 
 
 def sort_options(match: str, date_col: str | None) -> list[str]:
@@ -249,6 +287,14 @@ def index_name_column(index) -> str:
     return index.meta["name_column"] if "name_column" in index.meta else "auto"
 
 
+def display_name(row, name_col: str | None) -> str:
+    """The commenter's name from the chosen column, or '' when there is none."""
+    if not name_col or name_col not in row.index or pd.isna(row[name_col]):
+        return ""
+    name = str(row[name_col]).strip()
+    return "" if name.lower() in ("none", "nan") else name
+
+
 def detail_html(frame, row, mode: str, text_by_id: dict, meta_cols: list[str], sentences=None,
                 name_col: str | None = "auto") -> str:
     """The selected hit. Exact matches are shaded yellow. Fuzzy matches are shaded blue: the similar sentences
@@ -264,9 +310,7 @@ def detail_html(frame, row, mode: str, text_by_id: dict, meta_cols: list[str], s
     cutoff = float(plan.get("min_similarity", 0.0))
     score = float(r["score"]) if has_score(frame) else None
     passage_text = str(r["passage"]) if "passage" in r.index else str(r["snippet"])
-    if mode == "Excerpt":
-        body = str(r["snippet"])
-    elif mode == "Full comment":
+    if mode == "Full comment":
         body = text_by_id.get(r["comment_id"], "")
     else:
         body = passage_text
@@ -283,7 +327,7 @@ def detail_html(frame, row, mode: str, text_by_id: dict, meta_cols: list[str], s
             m = _pattern(passage_text).search(body) if passage_text.strip() else None
             ranges = [(m.start(), m.end(), f"passage similarity {score:.2f}")] if m else []
         else:
-            # Excerpt and Passage are both inside the matching passage: shade all of it.
+            # The passage view is the matching passage: shade all of it.
             ranges = [(0, len(body), f"passage similarity {score:.2f}")] if body else []
         body_html = shade(body, ranges)
         legend = f"Blue: the passage that matched (similarity {score:.2f}, cutoff {cutoff:.2f})."
@@ -293,8 +337,8 @@ def detail_html(frame, row, mode: str, text_by_id: dict, meta_cols: list[str], s
     comment_id = html.escape(str(r["comment_id"]))
     if name_col == "auto":
         name_col = detect_name_column(frame)
-    name = str(r[name_col]).strip() if name_col and name_col in r.index and not pd.isna(r[name_col]) else ""
-    if name and name.lower() not in ("none", "nan"):
+    name = display_name(r, name_col)
+    if name:
         heading = f"<b>{html.escape(name)}</b> ({comment_id})"
     else:
         heading = f"<b>{comment_id}</b>"
@@ -314,6 +358,30 @@ def position_text(frame, row) -> str:
     return f"Hit {int(row) + 1:,} of {len(frame):,}"
 
 
+def selection_text(frame, ids, name_col: str | None) -> tuple[str, str]:
+    """The selection count (Markdown) and the list of selected names for the collapsed table (HTML)."""
+    if frame is None or not ids:
+        return "**Nothing selected.** Tick Pick in the list to choose passages.", (
+            "<p class='cs-muted'>Nothing selected. Show the table and tick Pick to choose passages.</p>"
+        )
+    chosen = set(ids)
+    names = []
+    for _, r in frame.iterrows():
+        if r["comment_id"] in chosen:
+            cid = html.escape(str(r["comment_id"]))
+            names.append(f"<li>{html.escape(display_name(r, name_col)) or cid}</li>")
+    n = len(names)
+    return f"**{n:,} selected**", (
+        f"<div class='cs-muted'>{n:,} selected</div><ol class='cs-strip'>{''.join(names)}</ol>"
+    )
+
+
+def selected_rows(frame, ids) -> list[int]:
+    """Row numbers of the selected comments, in the order of the list."""
+    chosen = set(ids or [])
+    return [i for i, cid in enumerate(frame["comment_id"]) if cid in chosen]
+
+
 def exact_mode_for(label: str) -> str:
     """The search's mode value for a button label: 'Any word' -> 'any', anything else -> 'all'."""
     return MODE_ANY if label == EXACT_ANY else MODE_ALL
@@ -329,6 +397,104 @@ def search_comments(searcher, query: str, match: str, collapse: bool, cutoff: fl
     return searcher.search(query, top_k=n, method=method, min_similarity=float(cutoff), collapse=collapse)
 
 
+def split_text(text: str, limit: int = EXCEL_TEXT_LIMIT) -> list[str]:
+    """Split text into pieces of at most ``limit`` characters, breaking at spaces where possible.
+    Joining the pieces gives back the original text exactly."""
+    parts, rest = [], text
+    while len(rest) > limit:
+        cut = max(rest.rfind(" ", 1, limit), rest.rfind("\n", 1, limit))
+        if cut <= 0:
+            cut = limit
+        parts.append(rest[:cut])
+        rest = rest[cut:]
+    parts.append(rest)
+    return parts
+
+
+_ILLEGAL_XLSX = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def export_rows(frame, ids, text_by_id: dict, meta_cols: list[str], roles,
+                chosen=None) -> tuple[list[str], list[list]]:
+    """Headers and rows for the Excel export: the chosen list columns (all of them if ``chosen`` is None; the
+    comment ID always), then the matched passage and the full text. The full text is split across several
+    columns when it is longer than an Excel cell can hold."""
+    keep = selected_rows(frame, ids)
+    sub = frame.iloc[keep].reset_index(drop=True)
+    sub.attrs = dict(frame.attrs)
+    hits = hits_table(sub, meta_cols, roles)
+    if chosen is not None:
+        hits = select_table_columns(hits, chosen)
+    passages = [str(p) for p in sub["passage"]] if "passage" in sub.columns else [str(s) for s in sub["snippet"]]
+    pieces = [split_text(text_by_id.get(cid, "")) for cid in sub["comment_id"]]
+    n_parts = max((len(p) for p in pieces), default=1)
+    headers = [*hits.columns, "Matched passage", "Full text",
+               *[f"Full text (part {k})" for k in range(2, n_parts + 1)]]
+    rows = []
+    for i, values in enumerate(hits.values.tolist()):
+        text_cells = pieces[i] + [""] * (n_parts - len(pieces[i]))
+        rows.append([*values, passages[i], *text_cells])
+    return headers, rows
+
+
+def _fill_sheet(ws, rows: list[list], bold_first_row: bool) -> None:
+    """Write rows into a sheet. Text that starts with '=' is kept as text, not run as a formula."""
+    from openpyxl.styles import Font
+
+    for r_idx, row in enumerate(rows, start=1):
+        for c_idx, value in enumerate(row, start=1):
+            if isinstance(value, str):
+                value = _ILLEGAL_XLSX.sub("", value)[:EXCEL_TEXT_LIMIT + 767]
+            cell = ws.cell(row=r_idx, column=c_idx, value=value)
+            if isinstance(value, str) and value.startswith("="):
+                cell.data_type = "s"
+            if bold_first_row and r_idx == 1:
+                cell.font = Font(bold=True)
+
+
+def write_xlsx(path: str, headers: list[str], rows: list[list], info_rows: list[list] | None = None) -> None:
+    """Write the passages to one sheet, and the search settings to a second sheet if given."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Selected passages"
+    _fill_sheet(ws, [headers, *rows], bold_first_row=True)
+    ws.freeze_panes = "A2"
+    if info_rows:
+        info = wb.create_sheet("Search info")
+        _fill_sheet(info, info_rows, bold_first_row=True)
+        info.column_dimensions["A"].width = 24
+        info.column_dimensions["B"].width = 90
+    wb.save(path)
+
+
+def export_filename(info) -> str:
+    """commentsearch_export_<the search words>.xlsx, with anything but letters and digits replaced by '_'."""
+    query = (info or {}).get("query", "")
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", query).strip("_")[:60]
+    return f"commentsearch_export_{slug}.xlsx" if slug else "commentsearch_export.xlsx"
+
+
+def search_info_rows(info, n_rows: int, ticked: bool) -> list[list]:
+    """The 'Search info' sheet: what was searched, how, when, and what the export holds."""
+    info = info or {}
+    if info.get("match") == MATCH_EXACT:
+        method = "Exact words, " + ("all words" if info.get("exact_mode") == MODE_ALL else "any word")
+    else:
+        unit = "sentence" if info.get("level") == LEVEL_SENTENCE else "passage"
+        method = f"Fuzzy (by meaning), {unit} match, cutoff {float(info.get('cutoff', 0.0)):.2f}"
+    return [
+        ["Setting", "Value"],
+        ["Search", info.get("query", "")],
+        ["Match", method],
+        ["Duplicates", "One per duplicate group" if info.get("collapse") else "Every hit"],
+        ["Search date and time", info.get("time", "")],
+        ["Rows exported", n_rows],
+        ["Rows", "Ticked passages only" if ticked else "All current hits"],
+    ]
+
+
 def make_app(searcher, title: str = "Local comment search"):
     """Build the Gradio Blocks app. Nothing leaves the runtime; there is no external API."""
     import gradio as gr
@@ -337,7 +503,11 @@ def make_app(searcher, title: str = "Local comment search"):
     n_comments = len(comments)
     text_by_id = dict(zip(comments["comment_id"], comments["text"]))
     table_meta = meta_columns(comments)
-    empty_hits = hits_table(pd.DataFrame(), table_meta)
+    roles = column_roles(table_meta, index_name_column(searcher.index))
+    name_col = roles[0]  # the commenter-name column itself ("auto" resolved), or None
+    empty_hits = hits_table(pd.DataFrame(), table_meta, roles)
+    empty_view = with_pick(empty_hits, [])
+    list_choices = [c for c in empty_hits.columns if c != "comment_id"]
     date_cols = [c for c in comments.columns if pd.api.types.is_datetime64_any_dtype(comments[c]) and comments[c].notna().any()]
     date_col = date_cols[0] if date_cols else None
 
@@ -351,19 +521,40 @@ def make_app(searcher, title: str = "Local comment search"):
         comment_row = int(frame.attrs["rows"][int(row)])
         return searcher.sentence_similarities(query_text, [comment_row]).get(comment_row, [])
 
-    name_col = index_name_column(searcher.index)
-
-    def render(frame, row, mode):
+    def render(frame, row, mode, selected=()):
+        """The right-hand panel: the ticked passages together if any are ticked, otherwise the one selected hit."""
+        if frame is not None and len(frame) and selected:
+            picked = selected_rows(frame, selected)
+            if picked:
+                cards = [detail_html(frame, i, mode, text_by_id, table_meta, sentences_for(frame, i), name_col)
+                         for i in picked]
+                body = "".join(card.replace(CARD_CSS, "", 1) for card in cards)
+                return CARD_CSS + body, (
+                    f"**{len(picked):,} selected.** Clear the selection to browse one hit at a time."
+                )
         detail = detail_html(frame, row, mode, text_by_id, table_meta, sentences_for(frame, row), name_col)
         return detail, position_text(frame, row)
+
+    def table_update(all_hits, chosen, selected):
+        """The list with the chosen columns and the Pick tick boxes for the selected comments."""
+        base = empty_hits if all_hits is None else all_hits
+        view = with_pick(select_table_columns(base, chosen), selected)
+        return gr.update(value=view, datatype=table_datatypes(view),
+                         static_columns=list(range(1, len(view.columns))))
 
     def run(query, match, cutoffs, level, collapse, mode, sort_key, descending, exact_mode):
         sort_key = effective_sort(sort_key, match, date_col)
         keep_sort = gr.update(choices=sort_options(match, date_col), value=sort_key)
         if not (query or "").strip():
-            return ("Type a word or phrase to search.", None, empty_hits, None, gr.update(), None, None,
-                    *render(None, None, mode), keep_sort)
+            detail, position = render(None, None, mode)
+            count, strip = selection_text(None, [], name_col)
+            return ("Type a word or phrase to search.", table_update(None, [], []), None, gr.update(), None, None,
+                    detail, position, keep_sort, [], count, strip, None)
         cutoff = cutoffs.get(level, DEFAULT_CUTOFF[level])
+        search_info = {
+            "query": query.strip(), "match": match, "exact_mode": exact_mode, "level": level,
+            "cutoff": float(cutoff), "collapse": bool(collapse), "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
         frame = search_comments(searcher, query, match, bool(collapse), cutoff, level, exact_mode)
         frame = sort_frame(frame, sort_key, bool(descending), date_col)
         if frame.empty:
@@ -384,25 +575,26 @@ def make_app(searcher, title: str = "Local comment search"):
             else:
                 unit = "a sentence" if level == LEVEL_SENTENCE else "a passage"
                 status = f"**{n:,} comments** with {unit} at similarity {float(cutoff):.2f} or higher."
-        fd, csv_path = tempfile.mkstemp(suffix=".csv", prefix="commentsearch_results_")
-        os.close(fd)
-        frame.to_csv(csv_path, index=False)  # plain text in the CSV (no <mark> tags)
-        hits = hits_table(frame, table_meta)
-        defaults = default_table_columns(hits) if len(hits.columns) else []
-        choices = list(hits.columns) if len(hits.columns) else list(empty_hits.columns)
+        hits = hits_table(frame, table_meta, roles)
+        defaults = default_table_columns(hits, roles) if len(hits.columns) else []
+        choices = [c for c in (hits if len(hits.columns) else empty_hits).columns if c != "comment_id"]
         first = 0 if len(frame) else None
         detail, position = render(frame, first, mode)
+        count, strip = selection_text(frame, [], name_col)
         return (
             status,
-            csv_path,
-            select_table_columns(hits, defaults),
+            table_update(hits, defaults, []),
             frame,
-            gr.update(choices=choices, value=defaults),
+            gr.update(choices=choices, value=[c for c in defaults if c in choices]),
             hits,
             first,
             detail,
             position,
             keep_sort,
+            [],
+            count,
+            strip,
+            search_info,
         )
 
     with gr.Blocks(title=title, fill_height=True) as demo:
@@ -421,7 +613,7 @@ def make_app(searcher, title: str = "Local comment search"):
         with gr.Row():
             exact_btn = gr.Button("Exact words", size="sm", variant="primary", min_width=110)
             fuzzy_btn = gr.Button("Fuzzy (by meaning)", size="sm", variant="secondary", min_width=150)
-            collapse = gr.Checkbox(value=True, label="One per duplicate group", scale=2)
+            collapse = gr.Checkbox(value=False, label="One per duplicate group", scale=2)
         with gr.Row(visible=True) as exact_row:
             all_btn = gr.Button(EXACT_ALL, size="sm", variant="primary", min_width=110)
             any_btn = gr.Button(EXACT_ANY, size="sm", variant="secondary", min_width=110)
@@ -450,35 +642,50 @@ def make_app(searcher, title: str = "Local comment search"):
         frame_state = gr.State(None)
         row_state = gr.State(None)
         hits_state = gr.State(None)  # every column of every hit; the list shows a chosen subset
+        selected_state = gr.State([])  # comment IDs ticked in the list
+        search_state = gr.State(None)  # the search settings, for the export's file name and 'Search info' sheet
 
         with gr.Row(equal_height=False):
-            with gr.Column(scale=2, min_width=320):
-                with gr.Accordion("Columns and download", open=False):
-                    table_columns = gr.CheckboxGroup(choices=list(empty_hits.columns), value=[], label="Columns")
-                    download = gr.DownloadButton("Download results as CSV", value=None)
-                with gr.Row():
-                    sort_dd = gr.Dropdown(choices=sort_options(MATCH_EXACT, date_col), value=SORT_BEST,
-                                          label="Sort by", scale=3)
-                    sort_order = gr.Radio(SORT_ORDERS, value="Descending", label="Order", scale=2)
-                gr.HTML(
-                    f"<div class='cs-muted'>Hits <span class='cs-info' title='{html.escape(SIMILARITY_TIP, quote=True)}'>"
-                    "ⓘ similarity</span></div>"
-                )
-                hits = gr.Dataframe(
-                    value=empty_hits,
-                    interactive=False,
-                    wrap=False,
-                    show_label=False,
-                    max_height=520,
-                    elem_classes="cs-table",
-                )
-                with gr.Row():
-                    prev_btn = gr.Button("◀ Previous", size="sm")
-                    position = gr.Markdown("", elem_classes="cs-position")
-                    next_btn = gr.Button("Next ▶", size="sm")
+            with gr.Column(scale=2, min_width=300) as left:
+                with gr.Column() as table_panel:
+                    with gr.Accordion("Columns and export", open=False):
+                        table_columns = gr.CheckboxGroup(choices=list_choices, value=[], label="Columns")
+                        export_btn = gr.Button("Export to Excel", size="sm")
+                        export_file = gr.File(label="Excel file", interactive=False)
+                        export_note = gr.Markdown()
+                    with gr.Row():
+                        sort_dd = gr.Dropdown(choices=sort_options(MATCH_EXACT, date_col), value=SORT_BEST,
+                                              label="Sort by", scale=3)
+                        sort_order = gr.Radio(SORT_ORDERS, value="Descending", label="Order", scale=2)
+                    with gr.Row():
+                        select_all_btn = gr.Button("Select all", size="sm")
+                        select_none_btn = gr.Button("Select none", size="sm")
+                        hide_btn = gr.Button("Hide table ◀", size="sm")
+                    sel_count = gr.Markdown(selection_text(None, [], name_col)[0])
+                    gr.HTML(
+                        f"<div class='cs-muted'>Hits <span class='cs-info' title='{html.escape(SIMILARITY_TIP, quote=True)}'>"
+                        "ⓘ similarity</span> · tick Pick to choose passages</div>"
+                    )
+                    hits = gr.Dataframe(
+                        value=empty_view,
+                        datatype=table_datatypes(empty_view),
+                        static_columns=list(range(1, len(empty_view.columns))),
+                        interactive=True,
+                        wrap=False,
+                        show_label=False,
+                        max_height=520,
+                        elem_classes="cs-table",
+                    )
+                    with gr.Row():
+                        prev_btn = gr.Button("◀ Previous", size="sm")
+                        position = gr.Markdown("", elem_classes="cs-position")
+                        next_btn = gr.Button("Next ▶", size="sm")
+                with gr.Column(visible=False) as strip_panel:
+                    strip = gr.HTML(selection_text(None, [], name_col)[1])
+                    show_btn = gr.Button("▶ Show table", size="sm")
             with gr.Column(scale=3):
                 with gr.Row():
-                    show_mode = gr.Radio(SHOW_MODES, value="Excerpt", show_label=False, container=False, scale=5)
+                    show_mode = gr.Radio(SHOW_MODES, value="Passage", show_label=False, container=False, scale=5)
                     gr.HTML(
                         f"<span class='cs-info' title='{html.escape(SHOW_MODE_INFO, quote=True)}'>ⓘ</span>",
                         min_width=40,
@@ -491,7 +698,8 @@ def make_app(searcher, title: str = "Local comment search"):
 
         inputs = [query, match_state, cutoffs_state, level_state, collapse, show_mode, sort_dd, sort_order,
                   exact_mode_state]
-        outputs = [status, download, hits, frame_state, table_columns, hits_state, row_state, detail, position, sort_dd]
+        outputs = [status, hits, frame_state, table_columns, hits_state, row_state, detail, position, sort_dd,
+                   selected_state, sel_count, strip, search_state]
         go.click(run, inputs=inputs, outputs=outputs)
         query.submit(run, inputs=inputs, outputs=outputs)
         query.change(run, inputs=inputs, outputs=outputs, trigger_mode="always_last")
@@ -541,46 +749,104 @@ def make_app(searcher, title: str = "Local comment search"):
 
         similarity.release(on_cutoff, [similarity, cutoffs_state, level_state], [cutoffs_state]).then(run, inputs, outputs)
 
-        def on_columns(chosen, all_hits):
-            if all_hits is None:
-                return empty_hits
-            return select_table_columns(all_hits, chosen)
+        def on_columns(chosen, all_hits, selected):
+            return table_update(all_hits, chosen, selected)
 
-        table_columns.change(on_columns, inputs=[table_columns, hits_state], outputs=hits)
+        table_columns.change(on_columns, inputs=[table_columns, hits_state, selected_state], outputs=hits)
 
-        def on_sort(key, order, frame, chosen):
+        def on_sort(key, order, frame, chosen, selected, mode):
             if frame is None:
-                return frame, empty_hits, None, None, *render(None, None, "Excerpt")
+                detail_text, pos = render(None, None, mode)
+                return frame, table_update(None, [], []), None, None, detail_text, pos
             ordered = sort_frame(frame, key, order == "Descending", date_col)
-            all_hits = hits_table(ordered, table_meta)
+            all_hits = hits_table(ordered, table_meta, roles)
             first = 0 if len(ordered) else None
-            detail_text, pos = render(ordered, first, "Excerpt")
-            return ordered, select_table_columns(all_hits, chosen or default_table_columns(all_hits)), all_hits, first, detail_text, pos
+            detail_text, pos = render(ordered, first, mode, selected)
+            shown = chosen or default_table_columns(all_hits, roles)
+            return ordered, table_update(all_hits, shown, selected), all_hits, first, detail_text, pos
+
+        def on_sort_key(key, frame, chosen, selected, mode):
+            """Changing the sort key also sets the direction that key starts with."""
+            order = DEFAULT_SORT_ORDER.get(key, "Descending")
+            return (*on_sort(key, order, frame, chosen, selected, mode), gr.update(value=order))
 
         sort_outputs = [frame_state, hits, hits_state, row_state, detail, position]
-        sort_dd.change(on_sort, [sort_dd, sort_order, frame_state, table_columns], sort_outputs)
-        sort_order.change(on_sort, [sort_dd, sort_order, frame_state, table_columns], sort_outputs)
+        sort_inputs = [sort_dd, sort_order, frame_state, table_columns, selected_state, show_mode]
+        sort_dd.change(on_sort_key, [sort_dd, frame_state, table_columns, selected_state, show_mode],
+                       sort_outputs + [sort_order])
+        sort_order.change(on_sort, sort_inputs, sort_outputs)
 
-        def on_select(evt: gr.SelectData, frame, mode):
+        def on_select(evt: gr.SelectData, frame, mode, selected):
+            if evt.index[1] == 0:  # a tick in the Pick column: handled by the input event below
+                return gr.update(), gr.update(), gr.update()
             row = evt.index[0]
-            detail_text, pos = render(frame, row, mode)
+            detail_text, pos = render(frame, row, mode, selected)
             return row, detail_text, pos
 
-        def on_step(step, frame, row, mode):
+        def on_pick(table, frame, mode, row):
+            """A tick box changed: the new selection is every ticked row in the list."""
+            ids = [cid for cid, on in zip(table["comment_id"], table[PICK]) if on]
+            detail_text, pos = render(frame, row, mode, ids)
+            count, strip_html = selection_text(frame, ids, name_col)
+            return ids, count, strip_html, detail_text, pos
+
+        def apply_selection(ids, frame, all_hits, chosen, mode, row):
+            detail_text, pos = render(frame, row, mode, ids)
+            count, strip_html = selection_text(frame, ids, name_col)
+            return ids, table_update(all_hits, chosen, ids), count, strip_html, detail_text, pos
+
+        select_outputs = [selected_state, hits, sel_count, strip, detail, position]
+
+        def on_select_all(frame, all_hits, chosen, mode, row):
+            ids = [] if frame is None else list(frame["comment_id"])
+            return apply_selection(ids, frame, all_hits, chosen, mode, row)
+
+        def on_select_none(frame, all_hits, chosen, mode, row):
+            return apply_selection([], frame, all_hits, chosen, mode, row)
+
+        select_all_btn.click(on_select_all, [frame_state, hits_state, table_columns, show_mode, row_state], select_outputs)
+        select_none_btn.click(on_select_none, [frame_state, hits_state, table_columns, show_mode, row_state], select_outputs)
+        hits.select(on_select, [frame_state, show_mode, selected_state], [row_state, detail, position])
+        hits.input(on_pick, [hits, frame_state, show_mode, row_state],
+                   [selected_state, sel_count, strip, detail, position])
+
+        def on_step(step, frame, row, mode, selected):
             if frame is None or len(frame) == 0 or row is None:
-                return row, *render(frame, row, mode)
+                return row, *render(frame, row, mode, selected)
             new_row = min(max(int(row) + step, 0), len(frame) - 1)
-            return new_row, *render(frame, new_row, mode)
+            return new_row, *render(frame, new_row, mode, selected)
 
-        def on_mode(mode, frame, row):
-            return render(frame, row, mode)[0]
+        step_inputs = [frame_state, row_state, show_mode, selected_state]
+        prev_btn.click(lambda f, r, m, s: on_step(-1, f, r, m, s), inputs=step_inputs, outputs=[row_state, detail, position])
+        next_btn.click(lambda f, r, m, s: on_step(1, f, r, m, s), inputs=step_inputs, outputs=[row_state, detail, position])
 
-        hits.select(on_select, inputs=[frame_state, show_mode], outputs=[row_state, detail, position])
-        prev_btn.click(lambda f, r, m: on_step(-1, f, r, m), inputs=[frame_state, row_state, show_mode],
-                       outputs=[row_state, detail, position])
-        next_btn.click(lambda f, r, m: on_step(1, f, r, m), inputs=[frame_state, row_state, show_mode],
-                       outputs=[row_state, detail, position])
-        show_mode.change(on_mode, inputs=[show_mode, frame_state, row_state], outputs=detail)
+        def on_mode(mode, frame, row, selected):
+            return render(frame, row, mode, selected)[0]
+
+        show_mode.change(on_mode, inputs=[show_mode, frame_state, row_state, selected_state], outputs=detail)
+
+        def on_hide():
+            return gr.update(visible=False), gr.update(visible=True), gr.update(scale=1)
+
+        def on_show():
+            return gr.update(visible=True), gr.update(visible=False), gr.update(scale=2)
+
+        hide_btn.click(on_hide, None, [table_panel, strip_panel, left])
+        show_btn.click(on_show, None, [table_panel, strip_panel, left])
+
+        def on_export(frame, selected, chosen, info):
+            if frame is None or len(frame) == 0:
+                return None, "Nothing to export. Run a search first."
+            ids = selected or list(frame["comment_id"])
+            headers, rows = export_rows(frame, ids, text_by_id, table_meta, roles, chosen or [])
+            folder = tempfile.mkdtemp(prefix="commentsearch_")
+            path = os.path.join(folder, export_filename(info))
+            write_xlsx(path, headers, rows, search_info_rows(info, len(rows), bool(selected)))
+            which = "ticked" if selected else "all current"
+            return path, f"Exported {len(rows):,} {which} hit(s) to Excel."
+
+        export_btn.click(on_export, [frame_state, selected_state, table_columns, search_state],
+                         [export_file, export_note])
 
         def on_compare(q):
             if not (q or "").strip():

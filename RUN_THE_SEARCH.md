@@ -53,6 +53,18 @@ Type a number and press Enter. The search opens in your browser. Keep the termin
 
 The first start takes a few extra seconds while the fuzzy-search model loads. The model is downloaded from Hugging Face the first time only, so the first start needs internet access.
 
+## Using the window
+
+- **Search:** type in the box at the top. Results update as you type. Choose **Exact words** or **Fuzzy (by meaning)** above the box.
+- **Every hit or one per group:** the list shows every hit by default. Tick **One per duplicate group** to show only the best-matching comment from each group of copies.
+- **The list (left):** one row per comment. Name, comment ID, page and date come first. Use **Columns and export** to show or hide other columns.
+- **Picking passages:** tick **Pick** in a row, or use **Select all** / **Select none**. With one or more ticked, the right side shows all of them together, one after another. Clear the selection to go back to browsing one hit at a time with the arrow keys or **Previous** / **Next**.
+- **Hide table:** collapses the list to a narrow panel of the selected commenters' names, so the passages have more room. **Show table** brings the list back.
+- **Sort:** choose **Sort by** (Best match, Similarity, Comment ID or Date) and **Order**. Each sort starts in its own direction: Best match and Similarity from highest, Comment ID from A to Z, and Date from newest. Changing the sort changes Order to match; you can still change Order yourself.
+- **Export:** open **Columns and export** and press **Export to Excel**. The file holds the ticked passages, or every current hit if none are ticked. Its columns are the ones ticked under **Columns**, plus the comment ID, the matched passage and the full text. Comment text longer than one Excel cell is split across columns named "Full text (part 2)" and so on, so nothing is cut off.
+- **Export file:** the file is named `commentsearch_export_<your search words>.xlsx`. A second sheet, **Search info**, records the search words, the match type and cutoff, the duplicate setting, the date and time of the search, and how many rows were exported.
+- **Show (right side):** **Passage** shows the matching part of each comment, and **Full comment** shows the whole comment.
+
 ## Options
 
 | What you want | Command |

@@ -50,7 +50,7 @@ If nothing reaches the cutoff, the window says **No close matches**.
 
 ## Duplicate groups
 
-Many comments are copies of each other, either word for word or nearly so. The index marks these as duplicate groups. With **One per duplicate group** checked, the list shows only the best-matching comment from each group, and the others are hidden. Uncheck it to see every match. The count in the status line depends on this setting.
+Many comments are copies of each other, either word for word or nearly so. The index marks these as duplicate groups. By default, the list shows every hit. With **One per duplicate group** ticked, it shows only the best-matching comment from each group, and the others are hidden. The count in the status line depends on this setting.
 
 ## What to keep in mind
 
