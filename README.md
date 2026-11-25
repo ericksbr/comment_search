@@ -58,7 +58,7 @@ By default, the list shows every hit. Tick **One per duplicate group** to show o
 
 ## Run it in Colab
 
-Open `notebooks/quickstart.ipynb` from the Colab badge in that file. The first code cells install the package from this repository (branch `agency-feedback-ui`) and connect Google Drive, where the index is saved by default. Then edit the file path and column names in the settings cell.
+Open `notebooks/quickstart.ipynb` from the Colab badge in that file. The first code cells install the package from this repository (branch `main`) and connect Google Drive, where the index is saved by default. Then edit the file path and column names in the settings cell.
 
 ## Run it locally
 
