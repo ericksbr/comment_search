@@ -536,7 +536,7 @@ def make_app(searcher, title: str = "Local comment search"):
             status,
             table_update(hits, defaults, []),
             frame,
-            gr.update(choices=choices, value=defaults),
+            gr.update(choices=choices, value=[c for c in defaults if c in choices]),
             hits,
             first,
             detail,
