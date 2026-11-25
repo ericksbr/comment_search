@@ -53,6 +53,9 @@ SORT_SIM = "Similarity"
 SORT_ID = "Comment ID"
 SORT_DATE = "Date"
 SORT_ORDERS = ["Ascending", "Descending"]
+# The direction each sort key starts with when chosen. Best match and similarity: strongest first.
+# Comment ID: A to Z. Date: newest first.
+DEFAULT_SORT_ORDER = {SORT_BEST: "Descending", SORT_SIM: "Descending", SORT_ID: "Ascending", SORT_DATE: "Descending"}
 
 # The first column of the list: a tick box for picking passages to view together or export.
 PICK = "Pick"
@@ -762,9 +765,15 @@ def make_app(searcher, title: str = "Local comment search"):
             shown = chosen or default_table_columns(all_hits, roles)
             return ordered, table_update(all_hits, shown, selected), all_hits, first, detail_text, pos
 
+        def on_sort_key(key, frame, chosen, selected, mode):
+            """Changing the sort key also sets the direction that key starts with."""
+            order = DEFAULT_SORT_ORDER.get(key, "Descending")
+            return (*on_sort(key, order, frame, chosen, selected, mode), gr.update(value=order))
+
         sort_outputs = [frame_state, hits, hits_state, row_state, detail, position]
         sort_inputs = [sort_dd, sort_order, frame_state, table_columns, selected_state, show_mode]
-        sort_dd.change(on_sort, sort_inputs, sort_outputs)
+        sort_dd.change(on_sort_key, [sort_dd, frame_state, table_columns, selected_state, show_mode],
+                       sort_outputs + [sort_order])
         sort_order.change(on_sort, sort_inputs, sort_outputs)
 
         def on_select(evt: gr.SelectData, frame, mode, selected):
