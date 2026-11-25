@@ -11,7 +11,6 @@ import pandas as pd
 
 from .columns import detect_date_column, detect_name_column, detect_page_column
 from .exact import MODE_ALL, MODE_ANY, highlight_exact
-from .search import highlight
 
 _TABLE_INTERNAL = {"comment_id", "text", "dup_group", "dup_group_size", "boilerplate"}
 # Shown on the right of the list.
@@ -111,30 +110,8 @@ def meta_columns(comments: pd.DataFrame) -> list[str]:
     return [c for c in comments.columns if c not in _TABLE_INTERNAL]
 
 
-def matched_terms(passage: str, terms: list[str]) -> list[str]:
-    """Query terms that appear as whole words in the passage."""
-    return [t for t in terms if re.search(rf"\b{re.escape(t)}\b", passage, re.IGNORECASE)]
-
-
 def _message(text: str) -> str:
     return f"{CARD_CSS}<p class='cs-muted'>{html.escape(text)}</p>"
-
-
-def render_cards(frame: pd.DataFrame, terms: list[str], text_by_id: dict, collapse: bool) -> str:
-    """HTML cards for the results (kept for export and tests; the window shows the list and preview)."""
-    if frame.empty:
-        return _message("No matching comments.")
-    parts = [CARD_CSS]
-    for _, row in frame.iterrows():
-        passage = str(row["passage"]) if "passage" in row else str(row["snippet"])
-        parts.append(
-            "<div class='cs-card'>"
-            f"<div class='cs-head'><span class='cs-rank'>#{int(row['rank'])}</span>"
-            f"<b>{html.escape(str(row['comment_id']))}</b></div>"
-            f"<div class='cs-full'>{highlight(passage, terms)}</div>"
-            "</div>"
-        )
-    return "\n".join(parts)
 
 
 def _cell(value) -> str:

@@ -1,9 +1,7 @@
-import numpy as np
 import pandas as pd
 
 from commentsearch.checks import (
     check_passages_cover_text,
-    check_reload_matches,
     check_rows_accounted,
     check_unique_ids,
     run_build_checks,
@@ -69,11 +67,8 @@ def test_cover_text_check_catches_lost_words(comments, fake_encoder):
     assert not check_passages_cover_text(index.comments, broken).passed
 
 
-def test_reload_check_and_full_run(comments, fake_encoder, tmp_path):
+def test_full_run_passes(comments, fake_encoder):
     index = _build(comments, fake_encoder)
-    index.save(tmp_path / "idx")
-    loaded = CommentIndex.load(tmp_path / "idx")
-    assert check_reload_matches(index, loaded).passed
     searcher = Searcher(index, encoder=fake_encoder)
     checks = run_build_checks(raw_rows=len(comments) + comments.attrs["dropped_empty"], index=index, searcher=searcher)
     assert all(c.passed for c in checks), [c.line() for c in checks if not c.passed]

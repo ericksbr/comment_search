@@ -115,19 +115,6 @@ def check_duplicate_groups(index) -> Check:
     )
 
 
-def check_reload_matches(index, loaded) -> Check:
-    ok = (
-        len(loaded.comments) == len(index.comments)
-        and len(loaded.passages) == len(index.passages)
-        and loaded.meta.get("model") == index.meta.get("model")
-    )
-    return Check(
-        "Saved index reloads unchanged",
-        ok,
-        f"{len(loaded.comments):,} comments and {len(loaded.passages):,} passages after reload",
-    )
-
-
 def self_test(
     searcher,
     n: int = 20,

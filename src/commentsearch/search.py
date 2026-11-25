@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from .dedupe import first_per_group
-from .exact import MODE_ALL, MODE_ANY, build_fts, get_stemmer, match_fts, parse_query, passage_hits, StemPostings
+from .exact import MODE_ALL, build_fts, get_stemmer, match_fts, parse_query, passage_hits, StemPostings
 
 DEFAULT_RERANKER = "BAAI/bge-reranker-base"
 METHODS = ("rrf", "blend", "dense", "bm25", "exact", "semantic", "sentence")

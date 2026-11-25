@@ -1,4 +1,3 @@
-import numpy as np
 import pandas as pd
 
 from commentsearch.exact import highlight_exact, parse_query, passage_hits
